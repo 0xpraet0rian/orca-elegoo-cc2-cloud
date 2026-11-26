@@ -323,6 +323,7 @@ class Hub:
         self.printer_online = True
         self.devices = []
         self.login_win = None
+        self.rtc = None
         self.cur_code = None
         self.status_ts = 0.0
         self.busy = threading.Lock()
@@ -525,6 +526,11 @@ class Hub:
                 except Exception as e:
                     self.log("device list: %s" % e)
             return self.account_state()
+        if m == "cam_creds":
+            self.fetch_creds()
+            if not (self.rtc and self.rtc.get("token") and self.rtc.get("uid") is not None):
+                raise RuntimeError("no camera credentials for this printer")
+            return dict(self.rtc)
         if m == "acct_login":
             orca.host.ui  # fails early if the UI API is missing
             self.open_login_window()
@@ -799,6 +805,8 @@ class Hub:
         self.user_id = str(a["userId"])
         self.creds = {"appId": AGORA_APP_ID, "rtmUserId": a["rtmUserId"], "rtmToken": a["rtmToken"],
                       "userId": self.user_id, "sn": self.sn}
+        self.rtc = {"appId": AGORA_APP_ID, "channel": self.sn, "token": a.get("rtcToken", ""),
+                    "uid": a.get("rtcUserId")}
         return self.creds
 
     def ensure_login(self, timeout=25):
@@ -1487,6 +1495,12 @@ PAGE_HTML = r"""<!doctype html><meta charset="utf-8">
   </div>
 
   <div class="card" style="grid-column:1/-1">
+    <h3>Camera <span><span class="mut" id="camSt"></span> <button id="bCam">Turn on</button></span></h3>
+    <div id="camBox" style="display:none;background:#000;border-radius:8px;aspect-ratio:16/9;max-height:520px;overflow:hidden"></div>
+    <div class="mut" id="camHint">Live view from the printer camera (needs the cloud account; one viewer per account).</div>
+  </div>
+
+  <div class="card" style="grid-column:1/-1">
     <h3>Filament <span><label class="sw"><input type="checkbox" id="autoRefill"> Auto refill</label> <button id="bCanvas">Refresh</button></span></h3>
     <div class="slots" id="slots"><span class="mut">Press Refresh to read the filament slots.</span></div>
     <div class="row"><button id="bLoad">Load</button><button id="bUnload">Unload</button><span class="mut">Select a slot first.</span>
@@ -1516,6 +1530,7 @@ PAGE_HTML = r"""<!doctype html><meta charset="utf-8">
 })();
 </script>
 <script src="https://cdn.jsdelivr.net/npm/agora-rtm@2.3.0/agora-rtm.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/agora-rtc-sdk-ng@4.22.0/AgoraRTC_N-production.js"></script>
 <script>
 const $=id=>document.getElementById(id); const dec=new TextDecoder();
 let rtm=null, C=null, GEN=0, off=null;
@@ -1646,6 +1661,37 @@ for(const [id,key,lab] of [['fModel','fan','vModel'],['fAux','aux_fan','vAux'],[
   el.onchange=()=>{ run(null,1030,{[key]:Math.round(el.value*255/100)}).catch(()=>{}).finally(()=>{dragging=null;}); };
 }
 $('light').onchange=e=>{ dragging='light'; run('Light '+(e.target.checked?'on':'off'),1029,{power:e.target.checked?1:0}).catch(()=>{}).finally(()=>{dragging=null;}); };
+
+/* ---------- camera (Agora RTC, same flow as ElegooSlicer: live/vp8, channel = printer serial) ---------- */
+let CAM=null, CAMON=false;
+(function(){ try{ if(!navigator.mediaDevices){ navigator.mediaDevices={}; }
+  if(typeof navigator.mediaDevices.enumerateDevices!=='function') navigator.mediaDevices.enumerateDevices=()=>Promise.resolve([]);
+  if(typeof navigator.mediaDevices.getUserMedia!=='function') navigator.mediaDevices.getUserMedia=()=>Promise.reject(new Error('no capture devices')); }catch(e){} })();
+function camMsg(t,bad){ $('camSt').textContent=t||''; $('camSt').style.color=bad?'var(--bad)':''; }
+async function camStop(){
+  CAMON=false; $('bCam').textContent='Turn on'; $('camBox').style.display='none'; $('camBox').innerHTML=''; camMsg('');
+  if(CAM){ try{ CAM.removeAllListeners(); await CAM.leave(); }catch(e){} CAM=null; }
+}
+async function camStart(){
+  if(typeof AgoraRTC==='undefined'){ camMsg('RTC SDK not loaded',true); return; }
+  camMsg('connecting...'); $('bCam').disabled=true;
+  try{
+    const cfg=await call('cam_creds',{},30000);
+    try{ AgoraRTC.setLogLevel(3); AgoraRTC.disableLogUpload&&AgoraRTC.disableLogUpload(); }catch(e){}
+    const c=AgoraRTC.createClient({mode:'live',codec:'vp8'}); CAM=c;
+    const show=async(u)=>{ try{ await c.subscribe(u,'video'); if(u.videoTrack){ $('camBox').style.display='block'; $('camBox').innerHTML=''; u.videoTrack.play($('camBox')); camMsg('live'); } }catch(e){ camMsg('subscribe: '+((e&&e.message)||e),true); } };
+    c.on('user-published',async(u,m)=>{ if(m==='video') await show(u); });
+    c.on('user-unpublished',()=>camMsg('stream stopped'));
+    c.on('connection-state-change',(a,b)=>{ if(a==='DISCONNECTED'&&CAMON){ camMsg('disconnected',true); } });
+    await c.join(cfg.appId,String(cfg.channel),cfg.token,Number(cfg.uid));
+    await c.setClientRole('host');
+    CAMON=true; $('bCam').textContent='Turn off';
+    for(let i=0;i<30&&CAMON;i++){ const u=c.remoteUsers.find(x=>x.hasVideo)||c.remoteUsers[0]; if(u){ await show(u); if(u.videoTrack) break; } await new Promise(r=>setTimeout(r,1000)); }
+    if(CAMON && !$('camBox').innerHTML) camMsg('no video from the printer (offline, or another viewer is connected)',true);
+  }catch(e){ camMsg((e&&e.message)||String(e),true); await camStop(); }
+  finally{ $('bCam').disabled=false; }
+}
+$('bCam').onclick=()=>{ CAMON?camStop():camStart(); };
 
 /* ---------- filament / canvas ---------- */
 let CANVAS=null, SEL=null;
