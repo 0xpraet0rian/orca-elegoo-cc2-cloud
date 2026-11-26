@@ -1908,10 +1908,28 @@ class LanBridge(LoginProxy):
             HUB.downloads.pop(task, None)
 
 
+def _watchdog():
+    """Keep the cloud link alive: when 'Connect automatically' is on and the tab is open, reconnect if the poll loop
+    died or RTM dropped (e.g. after -10027, a Wi-Fi blip, or the printer coming back from sleep)."""
+    while True:
+        time.sleep(30)
+        try:
+            if not (SESSION.logged_in() and SESSION.get().get("auto", True) and HUB.page_ready):
+                continue
+            alive = HUB.poll_thread is not None and HUB.poll_thread.is_alive() and not HUB.poll_stop.is_set()
+            if alive and HUB.rtm_online:
+                continue
+            HUB.log("watchdog: link is down, reconnecting")
+            HUB.connect_cloud()
+        except Exception as e:  # noqa
+            HUB.log("watchdog: %s" % e)
+
+
 BRIDGE = None
 
 
 def _start_bridge():
+    threading.Thread(target=_watchdog, daemon=True, name="cc2-watchdog").start()
     global BRIDGE
     try:
         BRIDGE = LanBridge(HUB.log)
