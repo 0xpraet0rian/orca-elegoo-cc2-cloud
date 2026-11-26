@@ -1350,14 +1350,20 @@ class Hub:
                 raise RuntimeError("Open the 'Elegoo CC2' tab once so the RTM page can start.")
             if time.time() < self.login_fail_until:
                 raise RuntimeError("RTM login failed recently, retrying shortly: %s" % self.login_error)
-            self.login_event.clear()
-            self.fetch_creds()
-            self.gen += 1
-            self._post({"type": "login", "gen": self.gen, "cfg": self.creds})
-            if not self.login_event.wait(timeout) or not self.rtm_online:
-                self.login_fail_until = time.time() + 30
-                raise RuntimeError("RTM login failed: %s" % (self.login_error or "timeout (is ElegooSlicer closed?)"))
-            return True
+            for attempt in range(1, 4):
+                self.login_event.clear()
+                self.login_error = ""
+                self.fetch_creds()
+                self.gen += 1
+                self._post({"type": "login", "gen": self.gen, "cfg": self.creds})
+                if self.login_event.wait(timeout) and self.rtm_online:
+                    return True
+                if "10027" not in str(self.login_error) or attempt == 3 or not getattr(self.tl, "patient", False):
+                    break
+                self.log("RTM user still counted as online by an old session; retrying in 20 s (%d/3)" % attempt)
+                time.sleep(20)
+            self.login_fail_until = time.time() + 30
+            raise RuntimeError("RTM login failed: %s" % (self.login_error or "timeout (is ElegooSlicer closed?)"))
 
     def _renew(self):
         try:
@@ -1822,6 +1828,7 @@ class LanBridge(LoginProxy):
         if not done:
             return self._json(c, {"error_code": 0, "message": "OK"})
         HUB.tl.src = "orca"
+        HUB.tl.patient = True
         t0 = time.time()
         try:
             if data[:2] == b"PK":
@@ -2392,6 +2399,7 @@ function P(o){ try{ orca.postMessage(o);}catch(e){ L('bridge error '+e);} }
 function L(s){ const l=$('log'); l.textContent+=s+'\n'; l.scrollTop=l.scrollHeight; }
 
 /* ---------- RTM transport (unchanged protocol) ---------- */
+window.addEventListener('pagehide',()=>{ try{ if(rtm) rtm.logout(); }catch(e){} });
 async function drop(){
   if(off){ try{off();}catch(e){} off=null; }
   if(rtm){ try{ await rtm.logout(); }catch(e){} rtm=null; }
@@ -2401,7 +2409,7 @@ async function doLogin(cfg,gen){
   try{
     await drop();
     const {RTM}=AgoraRTM;
-    const r=new RTM(cfg.appId,cfg.rtmUserId,{presenceTimeout:300,heartbeatInterval:30});
+    const r=new RTM(cfg.appId,cfg.rtmUserId,{presenceTimeout:15,heartbeatInterval:5});
     const onStatus=e=>{ if(gen!==GEN) return; setChip('cRtm','RTM: '+String(e.state).toLowerCase(), String(e.state)==='CONNECTED'?'ok':'warn'); P({type:'rtm_status',gen,state:e.state,reason:e.reason}); };
     const onExp=()=>{ if(gen===GEN) P({type:'token_expiring',gen}); };
     const printer=cfg.userId+cfg.sn;
