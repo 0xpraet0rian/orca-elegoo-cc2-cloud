@@ -48,6 +48,9 @@ BASE = "https://matrix.elegoo.com"
 AGENT_ID = "elegoo_cc2_cloud"
 AGORA_APP_ID = "d035320941e34cd5bc4ec106eff05580"  # public id from elegoo-link rtm_service.cpp
 USER_INFO = os.path.expandvars(r"%APPDATA%\ElegooSlicer\user\user_info")
+_HERE = os.path.dirname(os.path.abspath(__file__))
+SESSION_FILE = os.path.join(_HERE, "cc2_session.dat")   # DPAPI-encrypted, under the Orca data dir
+LOGIN_URL = "https://account.elegoo.com/account/slicer-login?region=%s&theme=%s&deviceId=%s"
 UA = "Mozilla/5.0"
 
 # update_fn stage numbers (Bambu-style guess: 1 upload, 3 sending, 5 wait printer, 6 finished, 7 error)
@@ -64,6 +67,16 @@ def _dpapi(data: bytes) -> bytes:
     o = _Blob()
     if not ctypes.windll.crypt32.CryptUnprotectData(ctypes.byref(i), None, None, None, None, 0, ctypes.byref(o)):
         raise OSError("DPAPI decrypt failed")
+    out = ctypes.string_at(o.p, o.n)
+    ctypes.windll.kernel32.LocalFree(o.p)
+    return out
+
+
+def _protect(data: bytes) -> bytes:
+    i = _Blob(len(data), ctypes.cast(ctypes.create_string_buffer(data, len(data)), ctypes.POINTER(ctypes.c_char)))
+    o = _Blob()
+    if not ctypes.windll.crypt32.CryptProtectData(ctypes.byref(i), "cc2", None, None, None, 0, ctypes.byref(o)):
+        raise OSError("DPAPI encrypt failed")
     out = ctypes.string_at(o.p, o.n)
     ctypes.windll.kernel32.LocalFree(o.p)
     return out
@@ -178,14 +191,93 @@ def _dict(v):
     return v if isinstance(v, dict) else {}
 
 
+def _ms(v):
+    try:
+        v = float(v)
+    except Exception:
+        return 0
+    return int(v if v > 1e12 else v * 1000)
+
+
+class Session:
+    """The plugin's own Elegoo login (never ElegooSlicer's refresh token)."""
+
+    def __init__(self):
+        self.d = None
+        self.lock = threading.Lock()
+
+    def get(self):
+        with self.lock:
+            if self.d is None:
+                try:
+                    self.d = json.loads(_dpapi(_read_bytes(SESSION_FILE)).decode("utf-8"))
+                except Exception:
+                    self.d = {}
+            return dict(self.d)
+
+    def save(self, d):
+        with self.lock:
+            self.d = dict(d)
+            with open(SESSION_FILE, "wb") as f:
+                f.write(_protect(json.dumps(self.d).encode("utf-8")))
+
+    def update(self, **kw):
+        d = self.get()
+        d.update(kw)
+        self.save(d)
+
+    def clear(self):
+        with self.lock:
+            self.d = {}
+            try:
+                os.remove(SESSION_FILE)
+            except OSError:
+                pass
+
+    def logged_in(self):
+        return bool(self.get().get("token"))
+
+
+SESSION = Session()
+
+
+def _refresh_session():
+    d = SESSION.get()
+    rt = d.get("refreshToken")
+    if not rt:
+        raise RuntimeError("Session expired: sign in again in the Elegoo CC2 tab.")
+    status, body = _http("POST", BASE + "/api/v1/account-center-server/account-auth/token/refresh",
+                         {"Authorization": "Bearer " + d.get("token", ""), "Content-Type": "application/json"},
+                         data=json.dumps({"refreshToken": rt, "clientId": "Slicer"}).encode())
+    j = json.loads(body) if status == 200 else {}
+    if j.get("code") not in (0, 200) or not isinstance(j.get("data"), dict):
+        SESSION.update(token="", refreshToken="")
+        raise RuntimeError("Session expired: sign in again in the Elegoo CC2 tab.")
+    x = j["data"]
+    SESSION.update(token=x.get("accessToken") or x.get("token") or d.get("token"),
+                   refreshToken=x.get("refreshToken") or rt,
+                   exp=_ms(x.get("expiresTime") or x.get("accessTokenExpireTime")))
+
+
+def _token():
+    d = SESSION.get()
+    if not d.get("token"):
+        raise RuntimeError("Not signed in: use Sign in in the Elegoo CC2 tab.")
+    exp = d.get("exp") or 0
+    if exp and exp - time.time() * 1000 < 120000 and d.get("refreshToken"):
+        try:
+            _refresh_session()
+        except Exception as e:
+            HUB.log("token refresh: %s" % e)
+    return SESSION.get().get("token", "")
+
+
 def _api(path, params=None):
-    tok = _elegoo_user().get("token", "")
-    if not tok:
-        raise RuntimeError("No ElegooSlicer token found; sign in to ElegooSlicer first.")
+    tok = _token()
     url = BASE + path + (("?" + urllib.parse.urlencode(params)) if params else "")
     status, body = _http("GET", url, {"Authorization": "Bearer " + tok})
     if status in (401, 403):
-        raise RuntimeError("Elegoo cloud HTTP %s (token expired? sign in again in ElegooSlicer)" % status)
+        raise RuntimeError("Elegoo cloud HTTP %s (session expired? sign in again in the Elegoo CC2 tab)" % status)
     if status != 200:
         raise RuntimeError("Elegoo cloud HTTP %s" % status)
     j = json.loads(body)
@@ -225,6 +317,11 @@ class Hub:
         self.poll_thread = None
         self.ui_thread = None
         self.outbox = collections.deque(maxlen=500)
+        self.printer_online = True
+        self.devices = []
+        self.login_win = None
+        self.cur_code = 1
+        self.cur_gs = "IDLE"
 
     # ---- logging (never log tokens or signed URLs)
     def log(self, msg):
@@ -276,6 +373,7 @@ class Hub:
                 self.rtm_online = False
                 self.log("RTM page ready")
                 self._post({"type": "logs", "lines": list(self.logs)[-100:]})
+                self._push_account()
             elif t == "login_ok" and not stale:
                 self.rtm_online = True
                 self.login_error = ""
@@ -289,6 +387,9 @@ class Hub:
                 self.login_error = str(data.get("error"))
                 self.login_event.set()
                 self.log("RTM login error: %s" % self.login_error)
+                if "-10027" in self.login_error:
+                    self._post({"type": "note", "kind": "bad", "text":
+                                "Another Elegoo session is using this account (ElegooSlicer?). Close it, then press Connect."})
             elif t == "rtm_status" and not stale:
                 st = str(data.get("state"))
                 self.log("RTM state: %s (%s)" % (st, data.get("reason")))
@@ -296,8 +397,14 @@ class Hub:
                     self.rtm_online = False
                     self._fire_local_connect(2, "RTM %s" % data.get("reason"))
             elif t == "publish_err":
-                self.rtm_online = False
-                self._fail_pending(data.get("id"), str(data.get("error")))
+                err = str(data.get("error"))
+                if "-11033" in err:  # the printer (target user) is offline in the cloud; RTM itself is fine
+                    self._set_printer_online(False, "The printer is offline in the Elegoo cloud (powered off or no Wi-Fi?)")
+                else:
+                    self.rtm_online = False
+                self._fail_pending(data.get("id"), err)
+            elif t == "cmd":
+                threading.Thread(target=self._ui_cmd, args=(data,), daemon=True, name="cc2-ui-cmd").start()
             elif t == "token_expiring":
                 threading.Thread(target=self._renew, daemon=True).start()
             elif t == "msg":
@@ -321,9 +428,248 @@ class Hub:
 
     def _safe_login(self):
         try:
+            self.login_fail_until = 0.0
             self.ensure_login()
+            if not (self.poll_thread and self.poll_thread.is_alive() and not self.poll_stop.is_set()):
+                self.start_poll()
         except Exception as e:
             self.log("login: %s" % e)
+
+    def _set_printer_online(self, on, msg=None):
+        if self.printer_online != on:
+            self.printer_online = on
+            self._post({"type": "conn", "printer": on, "msg": msg})
+
+    # ---- commands from the tab (parameters validated; shapes copied from ElegooSlicer's own Device page)
+    def _ui_cmd(self, data):
+        rid, m, p = data.get("rid"), data.get("method"), _dict(data.get("params"))
+        try:
+            res = self._exec_ui(m, p)
+            self._post({"type": "cmd_result", "rid": rid, "ok": True, "result": res})
+        except Exception as e:
+            self.log("ui cmd %s: %s" % (m, e))
+            self._post({"type": "cmd_result", "rid": rid, "ok": False, "error": str(e)})
+
+    @staticmethod
+    def _int(v, lo, hi, name):
+        try:
+            n = int(round(float(v)))
+        except Exception:
+            raise ValueError("%s must be a number" % name)
+        if not lo <= n <= hi:
+            raise ValueError("%s must be %d-%d" % (name, lo, hi))
+        return n
+
+    def _exec_ui(self, m, p):
+        idle = self.cur_code == 1
+        if m == "acct_status":
+            if SESSION.logged_in() and not self.devices:
+                try:
+                    self.fetch_creds()
+                except Exception as e:
+                    self.log("device list: %s" % e)
+            return self.account_state()
+        if m == "acct_login":
+            orca.host.ui  # fails early if the UI API is missing
+            self.open_login_window()
+            return {"started": True}
+        if m == "acct_import":
+            self.import_from_elegooslicer()
+            return self.account_state()
+        if m == "acct_logout":
+            self.sign_out()
+            return self.account_state()
+        if m == "acct_select":
+            sn = str(p.get("sn", ""))
+            if sn not in [x["sn"] for x in self.devices]:
+                raise ValueError("unknown printer")
+            SESSION.update(sn=sn)
+            self.stop_poll()
+            self.logout()
+            self.status, self.sn = {}, sn
+            self._push_account()
+            return self.account_state()
+        if m == "acct_connect":
+            self.login_fail_until = 0.0
+            self.ensure_login()
+            self.request(1001, {}, timeout=15)
+            self.was_connected = True
+            self._after_login()
+            return self.account_state()
+        if m == "files":
+            files, page = [], 1
+            while page <= 20:
+                r = self.request(1044, {"storage_media": "local", "path": "/", "page": page, "page_size": 50}, timeout=25)
+                lst = r.get("file_list") or []
+                for f in lst:
+                    if isinstance(f, dict) and f.get("type", "file") == "file":
+                        files.append({k: f.get(k) for k in ("filename", "size", "layer", "print_time",
+                                                            "total_filament_used", "color_map", "create_time")})
+                if len(lst) < 50:
+                    break
+                page += 1
+            return {"files": files}
+        if m == "canvas":
+            return self.request(2005, {}, timeout=15)
+        if m == "history":
+            return self.request(1036, {}, timeout=25)
+        if m == "start_file":
+            if not idle:
+                raise RuntimeError("the printer is not idle")
+            name = str(p.get("filename", ""))
+            if not name or "/" in name or "\\" in name:
+                raise ValueError("bad file name")
+            slots = []
+            for x in p.get("slots") or []:
+                slots.append({"t": self._int(x.get("t"), 0, 15, "t"), "canvas_id": self._int(x.get("canvas_id"), 0, 3, "canvas"),
+                              "tray_id": self._int(x.get("tray_id"), 0, 3, "slot")})
+            cfg = {"delay_video": False, "printer_check": bool(p.get("leveling")), "print_layout": "A",
+                   "bedlevel_force": False, "slot_map": slots}
+            return self.request(1020, {"filename": name, "storage_media": "local", "config": cfg}, timeout=30)
+        m = int(m) if str(m).isdigit() else m
+        if m in (1021, 1022, 1023, 1024, 1025, 1036):
+            if m in (1024, 1025) and not idle:
+                raise RuntimeError("the printer is not idle")
+            return self.request(m, {}, timeout=300 if m in (1024, 1025) else 30)
+        if m == 1026:
+            ax = "".join(sorted(set(str(p.get("homed_axes", "")).lower()) & set("xyz")))
+            if not ax or not idle:
+                raise RuntimeError("homing needs an idle printer and axes x/y/z")
+            return self.request(1026, {"homed_axes": ax}, timeout=90)
+        if m == 1027:
+            ax = str(p.get("axes", "")).lower()
+            if ax not in ("x", "y", "z") or not idle:
+                raise RuntimeError("moving needs an idle printer and one axis")
+            if ax not in str(self.status.get("tool_head", {}).get("homed_axes", "") or ""):
+                raise RuntimeError("home the %s axis before moving it" % ax.upper())
+            dist = float(p.get("distance", 0))
+            if not (0 < abs(dist) <= 100):
+                raise ValueError("distance must be up to 100 mm")
+            return self.request(1027, {"axes": ax, "distance": dist}, timeout=30)
+        if m == 1028:
+            if "extruder" in p:
+                return self.request(1028, {"extruder": self._int(p["extruder"], 0, 350, "nozzle")}, timeout=20)
+            if "heater_bed" in p:
+                return self.request(1028, {"heater_bed": self._int(p["heater_bed"], 0, 120, "bed")}, timeout=20)
+            raise ValueError("nothing to set")
+        if m == 1029:
+            return self.request(1029, {"power": 1 if int(p.get("power", 0)) else 0}, timeout=15)
+        if m == 1030:
+            out = {k: self._int(p[k], 0, 255, k) for k in ("fan", "box_fan", "aux_fan") if k in p}
+            if not out:
+                raise ValueError("nothing to set")
+            return self.request(1030, out, timeout=15)
+        if m == 1031:
+            return self.request(1031, {"mode": self._int(p.get("mode"), 0, 3, "mode")}, timeout=15)
+        if m in (2001, 2002):
+            if not idle:
+                raise RuntimeError("the printer is not idle")
+            return self.request(m, {"canvas_id": self._int(p.get("canvas_id"), 0, 3, "canvas"),
+                                    "tray_id": self._int(p.get("tray_id"), 0, 3, "slot")}, timeout=300)
+        if m == 2004:
+            return self.request(2004, {"auto_refill": bool(p.get("auto_refill"))}, timeout=15)
+        if m == 1047:
+            names = [str(x) for x in (p.get("file_path") or [])]
+            if not names or any("/" in x or "\\" in x for x in names):
+                raise ValueError("bad file name")
+            return self.request(1047, {"storage_media": "local", "file_path": names}, timeout=30)
+        raise ValueError("command not allowed: %s" % m)
+
+    # ---- account (own login session)
+    def account_state(self):
+        d = SESSION.get()
+        return {"logged": bool(d.get("token")), "email": d.get("email", ""), "nickname": d.get("nickname", ""),
+                "source": d.get("source", ""), "sn": d.get("sn", "") or self.sn, "devices": self.devices,
+                "rtm": self.rtm_online, "printer": self.printer_online}
+
+    def _push_account(self):
+        self._post(dict(self.account_state(), type="account"))
+
+    def open_login_window(self):
+        d = SESSION.get()
+        dev_id = d.get("deviceId") or uuid.uuid4().hex
+        if not d.get("deviceId"):
+            SESSION.update(deviceId=dev_id)
+        url = LOGIN_URL % ("global", "light", dev_id)
+        html = ('<!doctype html><meta charset="utf-8"><body style="font-family:sans-serif;padding:20px">'
+                '<p>Opening the Elegoo sign-in page...</p><script>location.replace(%s)</script>' % json.dumps(url))
+        ui = orca.host.ui
+        self.log("sign-in window opening (Elegoo account page)")
+        self.login_win = ui.create_window(html=html, title="Sign in to Elegoo",
+                                          on_message=self._on_login_msg, on_close=self._on_login_close)
+
+    def _on_login_close(self, *a):
+        self.login_win = None
+
+    def _on_login_msg(self, data):
+        """Messages from the Elegoo sign-in page (same bridge ElegooSlicer uses). Only method names are logged."""
+        try:
+            if isinstance(data, str):
+                data = json.loads(data)
+            m = data.get("method") if isinstance(data, dict) else None
+            self.log("sign-in page message: %s" % (m or type(data).__name__))
+            if m == "report.userInfo":
+                threading.Thread(target=self._store_login, args=(_dict(data.get("params")),), daemon=True).start()
+            elif m == "report.websiteOpen":
+                url = str(_dict(data.get("params")).get("url", ""))
+                if url.startswith("https://"):
+                    threading.Thread(target=lambda: os.startfile(url), daemon=True).start()
+        except Exception as e:
+            self.log("sign-in message error: %r" % e)
+
+    def _store_login(self, u):
+        try:
+            tok = u.get("accessToken") or u.get("token")
+            if not tok:
+                raise RuntimeError("sign-in page sent no token")
+            keep = SESSION.get()
+            SESSION.save({"token": tok, "refreshToken": u.get("refreshToken", ""), "exp": _ms(u.get("expiresTime")),
+                          "userId": str(u.get("userId", "")), "email": u.get("email", ""),
+                          "nickname": u.get("nickname", ""), "deviceId": keep.get("deviceId", ""),
+                          "source": "own", "sn": keep.get("sn", "")})
+            self.log("signed in")
+            w = self.login_win
+            if w is not None:
+                try:
+                    w.close()
+                except Exception:
+                    pass
+            try:
+                self.fetch_creds()
+            except Exception as e:
+                self.log("device list: %s" % e)
+            self._push_account()
+            self._post({"type": "note", "kind": "ok", "text": "Signed in."})
+        except Exception as e:
+            self.log("store login: %s" % e)
+
+    def import_from_elegooslicer(self):
+        u = _elegoo_user()
+        if not u.get("token"):
+            raise RuntimeError("ElegooSlicer has no active login")
+        keep = SESSION.get()
+        # token only: the refresh token stays with ElegooSlicer so its session is never rotated from here
+        SESSION.save({"token": u["token"], "refreshToken": "", "exp": _ms(u.get("accessTokenExpireTime")),
+                      "userId": str(u.get("userId", "")), "email": u.get("email", ""),
+                      "nickname": u.get("nickname", ""), "deviceId": keep.get("deviceId", ""),
+                      "source": "imported", "sn": keep.get("sn", "")})
+        self.fetch_creds()
+        self._push_account()
+
+    def sign_out(self):
+        self.stop_poll()
+        self.was_connected = False
+        self.logout()
+        try:
+            if SESSION.get().get("source") == "own":
+                _http("POST", BASE + "/api/v1/account-center-server/account-auth/logout",
+                      {"Authorization": "Bearer " + SESSION.get().get("token", ""),
+                       "Content-Type": "application/json"}, data=b"{}", timeout=5)
+        except Exception:
+            pass
+        SESSION.clear()
+        self.devices, self.creds, self.sn, self.status = [], None, "", {}
+        self._push_account()
 
     def _fail_pending(self, rid, err):
         with self.lock:
@@ -383,7 +729,10 @@ class Hub:
         devs = d.get("devices") or []
         if not devs:
             raise RuntimeError("No printer bound to this Elegoo account")
-        dev = devs[0]
+        self.devices = [{"sn": x.get("serialNo"), "name": x.get("deviceName") or x.get("pcode") or x.get("serialNo")}
+                        for x in devs]
+        want = SESSION.get().get("sn")
+        dev = next((x for x in devs if x.get("serialNo") == want), devs[0])
         self.sn = dev["serialNo"]
         self.dev_name = dev.get("deviceName") or self.dev_name
         self.user_id = str(a["userId"])
@@ -440,10 +789,26 @@ class Hub:
         res = _dict((slot[1] or {}).get("result"))
         ec = res.get("error_code", 0)
         if ec not in (0, None):
-            raise RuntimeError("printer error_code %s (%s) for method %s" % (ec, res.get("error", ""), method))
+            err = str(res.get("error", ""))
+            if "-11033" in err:
+                self._set_printer_online(False, "The printer is offline in the Elegoo cloud (powered off or no Wi-Fi?)")
+                raise RuntimeError("printer is offline in the Elegoo cloud")
+            raise RuntimeError("printer error_code %s (%s) for method %s" % (ec, err, method))
+        self._set_printer_online(True)
         return res
 
     # ---- status -> Bambu-style push_status
+    LABELS = {0: "Initializing", 1: "Idle", 2: "Printing", 3: "Filament operation", 4: "Filament operation",
+              5: "Auto leveling", 6: "PID calibration", 7: "Resonance test", 8: "Self check", 9: "Updating",
+              10: "Homing", 11: "Receiving file", 12: "Composing video", 13: "Extruder operation",
+              14: "Emergency stop", 15: "Power loss recovery"}
+    # sub_status values while machine_status.status == 2 (from the elegoo-link CC2 adapter)
+    SUB2 = {1081: "Downloading", 1082: "Downloading", 1086: "Downloading", 1045: "Heating nozzle",
+            1096: "Heating nozzle", 1405: "Heating bed", 1906: "Heating bed", 2801: "Homing", 2802: "Homing",
+            2901: "Leveling", 2902: "Leveling", 2501: "Pausing", 2502: "Paused", 2505: "Paused",
+            2401: "Resuming", 2402: "Resuming", 2075: "Printing", 2077: "Finished", 2503: "Stopping",
+            2504: "Stopped"}
+
     def _emit_status(self):
         fn = self.cb.get("local_message")
         if not self.sn:
@@ -451,21 +816,26 @@ class Hub:
         s = self.status
         ps, ms = _dict(s.get("print_status")), _dict(s.get("machine_status"))
         ex, hb = _dict(s.get("extruder")), _dict(s.get("heater_bed"))
-        zt = _dict(s.get("ztemperature_sensor"))
-        # real values seen in ElegooSlicer logs: state in {"", "printing", "cancelled", "complete"};
-        # machine_status.status: 1 idle, 2 printing, 11 downloading file (sub 3000)
-        state = str(ps.get("state", "")).lower()
-        status = ms.get("status")
-        if state in ("printing", "running", "busy") or status == 2:
-            gs = "RUNNING"
-        elif state in ("paused", "pausing") or status in (5, 6):
-            gs = "PAUSE"
-        elif state in ("complete", "completed", "finished"):
-            gs = "FINISH"
-        elif state in ("cancelled", "canceled", "stopped", "failed", "error"):
-            gs = "FAILED"
+        zt, gm = _dict(s.get("ztemperature_sensor")), _dict(s.get("gcode_move"))
+        fans, th = _dict(s.get("fans")), _dict(s.get("tool_head")) or _dict(s.get("toolhead"))
+        code, sub = int(_num(ms.get("status"), 1)), int(_num(ms.get("sub_status"), 0))
+        pstate = str(ps.get("state", "")).lower()
+        if code == 2:
+            if sub in (2501, 2502, 2505):
+                gs = "PAUSE"
+            elif sub == 2077:
+                gs = "FINISH"
+            elif sub == 2504:
+                gs = "FAILED"
+            else:
+                gs = "RUNNING"
+        elif code == 1:
+            gs = "FINISH" if pstate in ("complete", "completed", "finished") else (
+                "FAILED" if pstate in ("cancelled", "canceled", "stopped", "failed", "error") else "IDLE")
         else:
             gs = "IDLE"
+        label = self.SUB2.get(sub) if code == 2 and sub in self.SUB2 else self.LABELS.get(code, "Status %s" % code)
+        self.cur_code, self.cur_gs = code, gs
         sw = _dict(self.attrs.get("software_version")).get("ota_version", "")
         pct = int(_num(ps.get("progress", ms.get("progress", 0))))
         msg = {"print": {
@@ -489,12 +859,18 @@ class Hub:
                 fn(self.sn, json.dumps(msg))
             except Exception as e:
                 self.logs.append("local_message cb failed: %r" % e)
+
+        def pc(k):
+            return int(round(_num(_dict(fans.get(k)).get("speed")) * 100 / 255.0))
         pr = msg["print"]
-        self._post({"type": "status", "state": gs, "progress": pct,
+        self._post({"type": "status", "state": gs, "label": label, "code": code, "sub": sub, "progress": pct,
                     "nozzle": pr["nozzle_temper"], "nozzle_t": pr["nozzle_target_temper"],
-                    "bed": pr["bed_temper"], "bed_t": pr["bed_target_temper"],
-                    "chamber": pr["chamber_temper"], "layer": pr["layer_num"], "total": pr["total_layer_num"],
-                    "left": pr["mc_remaining_time"], "file": pr["subtask_name"]})
+                    "bed": pr["bed_temper"], "bed_t": pr["bed_target_temper"], "chamber": pr["chamber_temper"],
+                    "layer": pr["layer_num"], "total": pr["total_layer_num"], "left": pr["mc_remaining_time"],
+                    "file": pr["subtask_name"], "x": _num(gm.get("x")), "y": _num(gm.get("y")), "z": _num(gm.get("z")),
+                    "homed": str(th.get("homed_axes", "") or ""), "speed": int(_num(gm.get("speed_mode"), 1)),
+                    "model_fan": pc("fan"), "aux_fan": pc("aux_fan"), "case_fan": pc("box_fan"),
+                    "light": _num(_dict(s.get("led")).get("status")) == 1})
 
     def _fire_local_connect(self, status, msg=""):
         fn = self.cb.get("local_connect")
@@ -511,12 +887,18 @@ class Hub:
         self.poll_stop = ev
 
         def run():
+            fails = 0
             while not ev.is_set():
                 try:
                     self.request(1002, {}, timeout=15)
+                    fails = 0
                 except Exception as e:
                     self.log("poll: %s" % e)
-                    ev.wait(10)
+                    fails += 1
+                    if "-10027" in self.login_error and fails >= 2:
+                        self.log("poll stopped: another session holds the account. Close ElegooSlicer, then press Connect.")
+                        return
+                    ev.wait(15 if not self.printer_online else 10)
                     continue
                 ev.wait(5)
         self.poll_thread = threading.Thread(target=run, daemon=True, name="cc2-poll")
@@ -736,6 +1118,8 @@ class CC2Agent(pa.PrinterAgentBase):
     def connect_printer(self, params):
         def run():
             try:
+                if not SESSION.logged_in():
+                    raise RuntimeError("Not signed in: open the Elegoo CC2 tab and use Sign in.")
                 HUB.ensure_login()
                 HUB.request(1001, {}, timeout=15)
                 HUB.was_connected = True
@@ -923,33 +1307,130 @@ ICON_SVG = r"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" wid
 
 PAGE_HTML = r"""<!doctype html><meta charset="utf-8">
 <style>
- body{font:13px var(--orca-font,sans-serif);color:var(--orca-fg,#ddd);background:var(--orca-bg,#222);margin:14px}
- .row{margin:6px 0} b{color:var(--orca-accent,#00ae42)}
- pre{background:rgba(0,0,0,.25);padding:8px;max-height:330px;overflow:auto;white-space:pre-wrap}
- button{padding:5px 12px;margin-right:6px}
- .card{border:1px solid var(--orca-border,#444);border-radius:8px;padding:12px;margin:10px 0;max-width:760px}
- .name{font-size:16px;font-weight:600} .sub{color:var(--orca-muted,#999);margin:4px 0}
- .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:10px;margin:10px 0}
- .k{display:block;color:var(--orca-muted,#999);font-size:11px;text-transform:uppercase}
+ :root{--bg:var(--orca-bg,#f4f6f8);--fg:var(--orca-fg,#1f2933);--mut:var(--orca-muted,#6b7785);--acc:var(--orca-accent,#0f766e);--bd:var(--orca-border,#d5dbe1);--card:#fff;--bad:#c0392b;--ok:#0f766e;--warn:#b7791f}
+ *{box-sizing:border-box} body{font:13px var(--orca-font,'Segoe UI',sans-serif);color:var(--fg);background:var(--bg);margin:0;padding:14px}
+ h3{margin:0;font-size:15px} .mut{color:var(--mut)} .grid{display:grid;gap:12px}
+ .top{display:flex;gap:14px;align-items:center;flex-wrap:wrap;margin-bottom:12px}
+ .top .name{font-size:18px;font-weight:600} .chips{display:flex;gap:6px;flex-wrap:wrap}
+ .chip{padding:2px 9px;border-radius:999px;border:1px solid var(--bd);background:var(--card);font-size:12px}
+ .chip.ok{border-color:var(--ok);color:var(--ok)} .chip.bad{border-color:var(--bad);color:var(--bad)} .chip.warn{border-color:var(--warn);color:var(--warn)}
+ .cols{display:grid;gap:12px;grid-template-columns:repeat(2,minmax(0,1fr));align-items:stretch}
+ @media (max-width:760px){.cols{grid-template-columns:1fr}}
+ .card{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:12px 14px}
+ .card{display:flex;flex-direction:column} .card>h3{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
+ button{font:inherit;padding:5px 11px;border:1px solid var(--bd);border-radius:6px;background:#fff;color:var(--fg);cursor:pointer}
+ button:hover:not(:disabled){border-color:var(--acc);color:var(--acc)} button:disabled{opacity:.45;cursor:not-allowed}
+ button.pri{background:var(--acc);border-color:var(--acc);color:#fff} button.pri:hover:not(:disabled){color:#fff;filter:brightness(1.1)}
+ button.dng{border-color:var(--bad);color:var(--bad)} button.sel{background:var(--acc);border-color:var(--acc);color:#fff}
+ input[type=number],select{font:inherit;padding:4px 6px;border:1px solid var(--bd);border-radius:6px;background:#fff;color:var(--fg)}
+ input[type=number]{width:68px} .row{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:6px 0}
+ .bar{height:8px;border-radius:5px;background:#e3e8ed;overflow:hidden} .bar>i{display:block;height:100%;background:var(--acc);width:0%}
+ .kv{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin:10px 0} .kv div{display:flex;flex-direction:column}
+ .k{font-size:11px;text-transform:uppercase;color:var(--mut)} .v{font-weight:600}
+ .pad{display:grid;grid-template-columns:repeat(3,44px);grid-template-rows:repeat(3,38px);gap:5px} .pad button{padding:0}
+ .zcol{display:flex;flex-direction:column;gap:5px} .zcol button{width:44px;height:38px;padding:0}
+ .slots{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:6px 0}
+ .slot{border:2px solid var(--bd);border-radius:10px;padding:8px 4px;text-align:center;cursor:pointer;background:#fff}
+ .slot.on{border-color:var(--acc);box-shadow:0 0 0 2px rgba(15,118,110,.18)} .slot .dot{width:34px;height:34px;border-radius:50%;margin:0 auto 4px;border:1px solid #0003}
+ .slot small{display:block;color:var(--mut)} .slot.empty .dot{background:repeating-linear-gradient(45deg,#eee,#eee 4px,#fff 4px,#fff 8px)}
+ table{width:100%;border-collapse:collapse} th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--bd);vertical-align:middle}
+ th{font-size:11px;text-transform:uppercase;color:var(--mut)} td.n{max-width:360px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+ .tabs{display:flex;gap:6px} .dots i{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:3px;border:1px solid #0003}
+ .toolbar{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;flex-wrap:wrap;gap:8px}
+ #note{position:sticky;top:0;z-index:5;margin:0 0 10px;padding:8px 12px;border-radius:8px;display:none;border:1px solid var(--bd);background:#fff}
+ #note.bad{border-color:var(--bad);color:var(--bad)} #note.ok{border-color:var(--ok);color:var(--ok)}
+ .panel{border:1px dashed var(--acc);border-radius:8px;padding:10px;margin:8px 0;background:#f1faf9}
+ .sw{display:inline-flex;align-items:center;gap:6px} details pre{background:#0001;padding:8px;max-height:220px;overflow:auto;white-space:pre-wrap;border-radius:6px}
+ .rng{display:grid;grid-template-columns:90px 1fr 44px;gap:8px;align-items:center;margin:6px 0}
 </style>
-<h3>Elegoo CC2 - cloud link</h3>
-<div class="row">RTM: <b id="rtm">starting</b></div>
-<div class="card">
-  <div class="name" id="pname">Printer: waiting for data...</div>
-  <div class="sub" id="pinfo"></div>
-  <div class="grid">
-    <div><span class="k">State</span><b id="st">-</b></div>
-    <div><span class="k">Progress</span><b id="pg">-</b></div>
-    <div><span class="k">Nozzle</span><b id="nz">-</b></div>
-    <div><span class="k">Bed</span><b id="bd">-</b></div>
-    <div><span class="k">Chamber</span><b id="ch">-</b></div>
-    <div><span class="k">Layer</span><b id="ly">-</b></div>
-    <div><span class="k">Remaining</span><b id="lf">-</b></div>
-  </div>
-  <div class="sub" id="det"></div>
+
+<div id="note"></div>
+<div class="top">
+  <div><div class="name" id="pname">Elegoo CC2</div><div class="mut" id="pinfo"></div></div>
+  <div class="chips"><span class="chip" id="cRtm">RTM: starting</span><span class="chip" id="cPr">Printer: -</span><span class="chip" id="cSt">-</span></div>
 </div>
-<div class="row"><button id="b">Connect / reconnect</button><span style="color:var(--orca-muted,#999)">Close ElegooSlicer while connected (one session per account).</span></div>
-<pre id="log"></pre>
+
+<div class="card" id="acct" style="margin-bottom:12px">
+  <h3>Account <span class="mut" id="aSub"></span></h3>
+  <div id="aOut" style="display:none">
+    <div class="row">You are not signed in to the Elegoo cloud.</div>
+    <div class="row"><button class="pri" id="bSign">Sign in with Elegoo</button>
+      <button id="bImport" title="Reuse the session of the ElegooSlicer installed on this PC (token only, read once)">Use ElegooSlicer session</button></div>
+    <div class="mut">The sign-in page is Elegoo's own; the plugin never sees your password.</div>
+  </div>
+  <div id="aIn" style="display:none">
+    <div class="row"><span>Signed in as <b id="aMail"></b></span><span class="mut" id="aSrc"></span><span class="chip" id="aLink">cloud link: offline</span></div>
+    <div class="row"><span>Printer</span><select id="aDev"></select>
+      <button class="pri" id="bConn">Connect via cloud</button><button id="bOut" class="dng">Log out</button></div>
+    <div class="mut">Close ElegooSlicer while connected: the Elegoo account allows one cloud session. LAN mode is not supported yet.</div>
+  </div>
+</div>
+
+<div class="cols">
+  <div class="card" id="cPrint">
+    <h3>Print <span class="mut" id="pFile"></span></h3>
+    <div class="bar"><i id="pBar"></i></div>
+    <div class="kv">
+      <div><span class="k">Progress</span><span class="v" id="vPg">-</span></div>
+      <div><span class="k">Layer</span><span class="v" id="vLy">-</span></div>
+      <div><span class="k">Remaining</span><span class="v" id="vLf">-</span></div>
+    </div>
+    <div class="row">
+      <button id="bPause">Pause</button><button id="bResume">Resume</button><button id="bStop" class="dng">Stop</button>
+    </div>
+    <div class="row"><span class="mut" style="width:70px">Speed</span>
+      <select id="sSpeed"><option value="0">Silent</option><option value="1">Balanced</option><option value="2">Sport</option><option value="3">Ludicrous</option></select>
+    </div>
+    <div id="cfmStop" class="panel" style="display:none">Stop the running print? <button id="yStop" class="dng">Yes, stop</button> <button id="nStop">No</button></div>
+  </div>
+
+  <div class="card">
+    <h3>Temperature</h3>
+    <div class="row"><span style="width:70px">Nozzle</span><b id="tNz">-</b><span class="mut">/</span><input type="number" id="iNz" min="0" max="350" placeholder="0"><button id="bNz">Set</button><button id="bNz0">Off</button></div>
+    <div class="row"><span style="width:70px">Bed</span><b id="tBd">-</b><span class="mut">/</span><input type="number" id="iBd" min="0" max="120" placeholder="0"><button id="bBd">Set</button><button id="bBd0">Off</button></div>
+    <div class="row"><span style="width:70px">Chamber</span><b id="tCh">-</b></div>
+  </div>
+
+  <div class="card">
+    <h3>Motion <span class="mut" id="pos">X - Y - Z -</span></h3>
+    <div class="row"><span class="mut">Step</span>
+      <span class="tabs" id="steps"><button data-s="0.1">0.1</button><button data-s="1">1</button><button data-s="10" class="sel">10</button><button data-s="30">30</button><span class="mut">mm</span></span></div>
+    <div class="row" style="gap:18px;align-items:flex-start">
+      <div class="pad">
+        <span></span><button data-mv="y+">Y+</button><span></span>
+        <button data-mv="x-">X-</button><button id="bHxy" title="Home X and Y">XY</button><button data-mv="x+">X+</button>
+        <span></span><button data-mv="y-">Y-</button><span></span>
+      </div>
+      <div class="zcol"><button data-mv="z+" title="Increase Z">Z+</button><button id="bHz" title="Home Z">Z</button><button data-mv="z-" title="Decrease Z">Z-</button></div>
+      <div class="zcol"><button id="bHall" title="Home all axes" style="height:auto;padding:8px 10px">Home<br>all</button></div>
+    </div>
+    <div class="mut" id="homedNote"></div>
+  </div>
+
+  <div class="card">
+    <h3>Fans and light</h3>
+    <div class="rng"><span>Model</span><input type="range" id="fModel" min="0" max="100" step="5"><b id="vModel">0%</b></div>
+    <div class="rng"><span>Assistance</span><input type="range" id="fAux" min="0" max="100" step="5"><b id="vAux">0%</b></div>
+    <div class="rng"><span>Case</span><input type="range" id="fCase" min="0" max="100" step="5"><b id="vCase">0%</b></div>
+    <div class="row"><label class="sw"><input type="checkbox" id="light"> Overhead light</label></div>
+  </div>
+
+  <div class="card" style="grid-column:1/-1">
+    <h3>Filament <span><label class="sw"><input type="checkbox" id="autoRefill"> Auto refill</label> <button id="bCanvas">Refresh</button></span></h3>
+    <div class="slots" id="slots"><span class="mut">Press Refresh to read the filament slots.</span></div>
+    <div class="row"><button id="bLoad">Load</button><button id="bUnload">Unload</button><span class="mut">Select a slot first.</span>
+      <span style="margin-left:auto" class="mut">Extruder:</span><button id="bFeed">Feed</button><button id="bRetreat">Retract</button></div>
+  </div>
+
+  <div class="card" style="grid-column:1/-1">
+    <div class="toolbar"><div class="tabs"><button id="tFiles" class="sel">Printer files</button><button id="tHist">Print history</button></div><button id="bFiles">Refresh</button></div>
+    <div id="startPanel" class="panel" style="display:none"></div>
+    <div id="fileBox"><span class="mut">Press Refresh to list the files.</span></div>
+  </div>
+</div>
+
+<details style="margin-top:12px"><summary class="mut">Log</summary><pre id="log"></pre></details>
+
 <script>
 // The page lives on an opaque origin inside Orca: localStorage/sessionStorage throw. Give the SDK in-memory ones.
 (function(){
@@ -965,65 +1446,221 @@ PAGE_HTML = r"""<!doctype html><meta charset="utf-8">
 </script>
 <script src="https://cdn.jsdelivr.net/npm/agora-rtm@2.3.0/agora-rtm.js"></script>
 <script>
-const $=id=>document.getElementById(id); let rtm=null, C=null, GEN=0, off=null;
-const dec=new TextDecoder();
+const $=id=>document.getElementById(id); const dec=new TextDecoder();
+let rtm=null, C=null, GEN=0, off=null;
 function P(o){ try{ orca.postMessage(o);}catch(e){ L('bridge error '+e);} }
 function L(s){ const l=$('log'); l.textContent+=s+'\n'; l.scrollTop=l.scrollHeight; }
+
+/* ---------- RTM transport (unchanged protocol) ---------- */
 async function drop(){
   if(off){ try{off();}catch(e){} off=null; }
   if(rtm){ try{ await rtm.logout(); }catch(e){} rtm=null; }
 }
 async function doLogin(cfg,gen){
-  C=cfg; GEN=gen; $('rtm').textContent='logging in';
+  C=cfg; GEN=gen; setChip('cRtm','RTM: logging in','warn');
   try{
     await drop();
     const {RTM}=AgoraRTM;
     const r=new RTM(cfg.appId,cfg.rtmUserId,{presenceTimeout:300,heartbeatInterval:30});
-    const onStatus=e=>{ if(gen!==GEN) return; $('rtm').textContent=e.state; P({type:'rtm_status',gen,state:e.state,reason:e.reason}); };
+    const onStatus=e=>{ if(gen!==GEN) return; setChip('cRtm','RTM: '+String(e.state).toLowerCase(), String(e.state)==='CONNECTED'?'ok':'warn'); P({type:'rtm_status',gen,state:e.state,reason:e.reason}); };
     const onExp=()=>{ if(gen===GEN) P({type:'token_expiring',gen}); };
     const printer=cfg.userId+cfg.sn;
-    const onMsg=e=>{
-      if(gen!==GEN || e.publisher!==printer) return;   // only the printer may talk to us
-      let t=e.message; if(typeof t!=='string') t=dec.decode(t);
-      P({type:'msg',gen,text:t});
-    };
-    r.addEventListener('status',onStatus);
-    r.addEventListener('tokenPrivilegeWillExpire',onExp);
-    r.addEventListener('message',onMsg);
+    const onMsg=e=>{ if(gen!==GEN || e.publisher!==printer) return; let t=e.message; if(typeof t!=='string') t=dec.decode(t); P({type:'msg',gen,text:t}); };
+    r.addEventListener('status',onStatus); r.addEventListener('tokenPrivilegeWillExpire',onExp); r.addEventListener('message',onMsg);
     off=()=>{ r.removeEventListener('status',onStatus); r.removeEventListener('tokenPrivilegeWillExpire',onExp); r.removeEventListener('message',onMsg); };
     rtm=r;
     await r.login({token:cfg.rtmToken});
     await r.subscribe(cfg.userId,{withMessage:true,withPresence:true});
-    $('rtm').textContent='online'; P({type:'login_ok',gen});
-  }catch(e){ $('rtm').textContent='error'; P({type:'login_err',gen,error:(e&&e.message)||JSON.stringify(e)}); }
+    setChip('cRtm','RTM: online','ok'); P({type:'login_ok',gen});
+  }catch(e){ setChip('cRtm','RTM: error','bad'); P({type:'login_err',gen,error:(e&&e.message)||JSON.stringify(e)}); }
 }
+
+/* ---------- UI helpers ---------- */
+function setChip(id,text,cls){ const e=$(id); e.textContent=text; e.className='chip '+(cls||''); }
+let noteT=null;
+function note(text,kind){ const n=$('note'); n.textContent=text; n.className=kind||''; n.style.display='block'; clearTimeout(noteT); noteT=setTimeout(()=>{n.style.display='none';},kind==='bad'?9000:3500); }
+let RID=0; const WAIT={};
+function call(method,params,ms){ return new Promise((res,rej)=>{ const rid=++RID; const t=setTimeout(()=>{delete WAIT[rid];rej(new Error('timeout'));},ms||45000); WAIT[rid]={res,rej,t}; P({type:'cmd',rid,method,params:params||{}}); }); }
+async function run(label,method,params,ms){ try{ const r=await call(method,params,ms); if(label) note(label,'ok'); return r; }catch(e){ note((label||String(method))+' failed: '+e.message,'bad'); throw e; } }
+const fmtT=m=>{ if(!m) return '-'; const h=Math.floor(m/60), mm=Math.round(m%60); return h?h+' h '+mm+' min':mm+' min'; };
+const fmtS=s=>{ if(!s) return '-'; const m=Math.round(s/60); return fmtT(m); };
+const fmtMB=b=>b?(b/1048576).toFixed(b<1048576*10?2:1)+' MB':'-';
+const fmtD=t=>{ if(!t) return '-'; const d=new Date((t>1e12?t:t*1000)); return d.toISOString().slice(0,16).replace('T',' '); };
+const esc=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+/* ---------- live state ---------- */
+let S={code:1,state:'IDLE',homed:'',online:false}; let STEP=10, dragging=null;
+function applyStatus(m){
+  S=m; const idle=(m.code===1), printing=(m.code===2), paused=(m.state==='PAUSE');
+  $('cSt').textContent=m.label||m.state; $('cSt').className='chip '+(printing?'ok':(m.code===14?'bad':''));
+  $('pFile').textContent=m.file||''; $('pBar').style.width=Math.min(100,m.progress||0)+'%';
+  $('vPg').textContent=(m.progress||0)+'%'; $('vLy').textContent=m.total?(m.layer+' / '+m.total):'-'; $('vLf').textContent=fmtT(m.left);
+  $('tNz').textContent=Math.round(m.nozzle)+' C'; $('tBd').textContent=Math.round(m.bed)+' C'; $('tCh').textContent=Math.round(m.chamber)+' C';
+  if(document.activeElement!==$('iNz')) $('iNz').placeholder=Math.round(m.nozzle_t||0); if(document.activeElement!==$('iBd')) $('iBd').placeholder=Math.round(m.bed_t||0);
+  $('pos').textContent='X '+(+m.x).toFixed(1)+'  Y '+(+m.y).toFixed(1)+'  Z '+(+m.z).toFixed(1);
+  $('homedNote').textContent=m.homed?('Homed axes: '+m.homed.toUpperCase()):'Not homed: home the axes before moving.';
+  for(const [id,k,lab] of [['fModel','model','vModel'],['fAux','aux','vAux'],['fCase','case','vCase']]){ if(dragging!==id){ $(id).value=m[k+'_fan']; } $(lab).textContent=Math.round($(id).value)+'%'; }
+  if(dragging!=='light') $('light').checked=!!m.light; if(document.activeElement!==$('sSpeed')) $('sSpeed').value=String(m.speed);
+  const canPause=printing&&!paused, canResume=paused;
+  $('bPause').disabled=!canPause; $('bResume').disabled=!canResume; $('bStop').disabled=!(printing||paused);
+  document.querySelectorAll('[data-mv],#bHxy,#bHz,#bHall').forEach(b=>b.disabled=!idle);
+  $('bNz').disabled=$('bNz0').disabled=$('bBd').disabled=$('bBd0').disabled=!(idle||printing||m.code===13);
+  $('bLoad').disabled=$('bUnload').disabled=$('bFeed').disabled=$('bRetreat').disabled=!idle;
+}
+
+/* ---------- messages from Python ---------- */
 async function handle(m){
   if(!m) return;
   if(m.type==='login') doLogin(m.cfg,m.gen);
-  else if(m.type==='logout'){ GEN++; await drop(); $('rtm').textContent='logged out'; }
-  else if(m.type==='renew' && rtm) { try{ await rtm.renewToken(m.token);}catch(e){ L('renew '+e);} }
+  else if(m.type==='logout'){ GEN++; await drop(); setChip('cRtm','RTM: logged out',''); }
+  else if(m.type==='renew' && rtm){ try{ await rtm.renewToken(m.token);}catch(e){ L('renew '+e);} }
   else if(m.type==='publish'){
-    if(!rtm || !C){ P({type:'publish_err',id:m.id,error:'RTM not logged in'}); return; }
+    if(!rtm||!C){ P({type:'publish_err',id:m.id,error:'RTM not logged in'}); return; }
     try{ await rtm.publish(C.userId+C.sn,m.text,{channelType:'USER',customType:'PlainText'}); }
     catch(e){ P({type:'publish_err',id:m.id,error:(e&&e.message)||JSON.stringify(e)}); }
   }
   else if(m.type==='log') L(m.line);
   else if(m.type==='logs') (m.lines||[]).forEach(L);
-  else if(m.type==='info'){ $('pname').textContent=m.name||'Printer'; $('pinfo').textContent=[m.model,'firmware '+(m.fw||'?'),'LAN IP '+(m.ip||'?')].join('  |  '); }
-  else if(m.type==='status'){
-    const t=(a,b)=>Math.round(a)+(b?' / '+Math.round(b):'')+' C';
-    $('st').textContent=m.state; $('pg').textContent=m.progress+'%';
-    $('nz').textContent=t(m.nozzle,m.nozzle_t); $('bd').textContent=t(m.bed,m.bed_t); $('ch').textContent=Math.round(m.chamber)+' C';
-    $('ly').textContent=m.total?(m.layer+' / '+m.total):'-'; $('lf').textContent=m.left?(m.left+' min'):'-';
-    $('det').textContent=m.file?('File: '+m.file):''; }
+  else if(m.type==='info'){ $('pname').textContent=m.name||'Elegoo CC2'; $('pinfo').textContent=[m.model,'firmware '+(m.fw||'?'),'LAN IP '+(m.ip||'?'),'SN '+(m.sn||'?')].join('  |  '); }
+  else if(m.type==='note'){ note(m.text,m.kind); }
+  else if(m.type==='account'){ renderAccount(m); }
+  else if(m.type==='conn'){ setChip('cPr','Printer: '+(m.printer?'online':'offline'),m.printer?'ok':'bad'); if(m.msg) note(m.msg,m.printer?'ok':'bad'); }
+  else if(m.type==='status'){ setChip('cPr','Printer: online','ok'); applyStatus(m); }
+  else if(m.type==='cmd_result'){ const w=WAIT[m.rid]; if(!w) return; clearTimeout(w.t); delete WAIT[m.rid]; m.ok?w.res(m.result):w.rej(new Error(m.error)); }
   else if(m.type==='batch'){ for(const it of (m.items||[])) await handle(it); }
 }
 orca.onMessage(handle);
 setInterval(()=>P({type:'pull'}),300);
-$('b').onclick=()=>P({type:'click_login'});
-if(typeof AgoraRTM==='undefined'){ $('rtm').textContent='SDK not loaded (no CDN access?)'; L('AgoraRTM script failed to load'); }
+
+/* ---------- controls ---------- */
+/* ---------- account ---------- */
+let ACC=null;
+function renderAccount(a){
+  ACC=a; $('aOut').style.display=a.logged?'none':'block'; $('aIn').style.display=a.logged?'block':'none';
+  if(!a.logged){ return; }
+  $('aMail').textContent=a.email||a.nickname||'(account)'; $('aSrc').textContent=a.source==='imported'?'(session imported from ElegooSlicer)':'';
+  const sel=$('aDev'); sel.innerHTML=(a.devices||[]).map(d=>'<option value="'+esc(d.sn)+'"'+(d.sn===a.sn?' selected':'')+'>'+esc(d.name)+' ('+esc(d.sn)+')</option>').join('');
+  const on=a.rtm; $('aLink').textContent='cloud link: '+(on?'online':'offline'); $('aLink').className='chip '+(on?'ok':'');
+}
+async function loadAccount(){ try{ renderAccount(await call('acct_status')); }catch(e){ note('Account: '+e.message,'bad'); } }
+$('bSign').onclick=()=>run('Opening the Elegoo sign-in window...','acct_login').catch(()=>{});
+$('bImport').onclick=()=>run('Session imported','acct_import').then(renderAccount).catch(()=>{});
+$('bOut').onclick=()=>run('Signed out','acct_logout').then(renderAccount).catch(()=>{});
+$('aDev').onchange=e=>run('Printer selected','acct_select',{sn:e.target.value}).then(renderAccount).catch(()=>{});
+$('bConn').onclick=()=>run('Connected','acct_connect',{},60000).then(renderAccount).catch(()=>{});
+$('bPause').onclick=()=>run('Paused',1021).catch(()=>{});
+$('bResume').onclick=()=>run('Resumed',1023).catch(()=>{});
+$('bStop').onclick=()=>{ $('cfmStop').style.display='block'; };
+$('nStop').onclick=()=>{ $('cfmStop').style.display='none'; };
+$('yStop').onclick=()=>{ $('cfmStop').style.display='none'; run('Stopped',1022).catch(()=>{}); };
+$('sSpeed').onchange=e=>run('Speed set',1031,{mode:+e.target.value}).catch(()=>{});
+const setT=(key,id,v)=>run(key==='extruder'?'Nozzle target set':'Bed target set',1028,{[key]:v}).catch(()=>{});
+$('bNz').onclick=()=>{ const v=parseInt($('iNz').value); if(!(v>=0&&v<=350)) return note('Nozzle 0-350 C','bad'); setT('extruder','iNz',v); $('iNz').value=''; };
+$('bBd').onclick=()=>{ const v=parseInt($('iBd').value); if(!(v>=0&&v<=120)) return note('Bed 0-120 C','bad'); setT('heater_bed','iBd',v); $('iBd').value=''; };
+$('bNz0').onclick=()=>setT('extruder','iNz',0); $('bBd0').onclick=()=>setT('heater_bed','iBd',0);
+document.querySelectorAll('#steps button').forEach(b=>b.onclick=()=>{ STEP=+b.dataset.s; document.querySelectorAll('#steps button').forEach(x=>x.classList.toggle('sel',x===b)); });
+document.querySelectorAll('[data-mv]').forEach(b=>b.onclick=()=>{ const [ax,sg]=[b.dataset.mv[0],b.dataset.mv[1]]; run(null,1027,{axes:ax,distance:(sg==='-'?-1:1)*STEP}).catch(()=>{}); });
+$('bHxy').onclick=()=>run('Homing XY',1026,{homed_axes:'xy'},60000).catch(()=>{});
+$('bHz').onclick=()=>run('Homing Z',1026,{homed_axes:'z'},60000).catch(()=>{});
+$('bHall').onclick=()=>run('Homing all axes',1026,{homed_axes:'xyz'},90000).catch(()=>{});
+for(const [id,key,lab] of [['fModel','fan','vModel'],['fAux','aux_fan','vAux'],['fCase','box_fan','vCase']]){
+  const el=$(id);
+  el.oninput=()=>{ dragging=id; $(lab).textContent=el.value+'%'; };
+  el.onchange=()=>{ run(null,1030,{[key]:Math.round(el.value*255/100)}).catch(()=>{}).finally(()=>{dragging=null;}); };
+}
+$('light').onchange=e=>{ dragging='light'; run('Light '+(e.target.checked?'on':'off'),1029,{power:e.target.checked?1:0}).catch(()=>{}).finally(()=>{dragging=null;}); };
+
+/* ---------- filament / canvas ---------- */
+let CANVAS=null, SEL=null;
+function renderCanvas(){
+  const box=$('slots'); box.innerHTML=''; if(!CANVAS){ box.innerHTML='<span class="mut">No canvas data.</span>'; return; }
+  const list=(CANVAS.canvas_list||[]).filter(c=>c.connected);
+  if(!list.length){ box.innerHTML='<span class="mut">No Canvas connected.</span>'; return; }
+  for(const c of list){ for(const t of (c.tray_list||[])){
+    const d=document.createElement('div'); const has=t.filament_type||t.filament_name; d.className='slot'+(has?'':' empty')+((SEL&&SEL.c===c.canvas_id&&SEL.t===t.tray_id)?' on':'');
+    d.innerHTML='<div class="dot" style="background:'+esc(t.filament_color||'#ddd')+'"></div><b>'+esc(t.filament_type||'-')+'</b><small>'+(list.length>1?'C'+c.canvas_id+' ':'')+'slot '+(t.tray_id+1)+'</small>';
+    d.onclick=()=>{ SEL={c:c.canvas_id,t:t.tray_id}; renderCanvas(); };
+    box.appendChild(d);
+  } }
+  $('autoRefill').checked=!!CANVAS.auto_refill;
+}
+async function loadCanvas(){ try{ const r=await call('canvas'); CANVAS=r.canvas_info||null; renderCanvas(); }catch(e){ note('Canvas: '+e.message,'bad'); } }
+$('bCanvas').onclick=loadCanvas;
+$('bLoad').onclick=()=>{ if(!SEL) return note('Select a slot first','bad'); run('Loading filament',2001,{canvas_id:SEL.c,tray_id:SEL.t},300000).then(loadCanvas).catch(()=>{}); };
+$('bUnload').onclick=()=>{ if(!SEL) return note('Select a slot first','bad'); run('Unloading filament',2002,{canvas_id:SEL.c,tray_id:SEL.t},300000).then(loadCanvas).catch(()=>{}); };
+$('bFeed').onclick=()=>run('Feeding',1024,{},300000).catch(()=>{});
+$('bRetreat').onclick=()=>run('Retracting',1025,{},300000).catch(()=>{});
+$('autoRefill').onchange=e=>run('Auto refill '+(e.target.checked?'on':'off'),2004,{auto_refill:e.target.checked}).catch(()=>{});
+
+/* ---------- files and history ---------- */
+let TAB='files', FILES=[];
+$('tFiles').onclick=()=>{ TAB='files'; $('tFiles').classList.add('sel'); $('tHist').classList.remove('sel'); refresh(); };
+$('tHist').onclick=()=>{ TAB='hist'; $('tHist').classList.add('sel'); $('tFiles').classList.remove('sel'); refresh(); };
+$('bFiles').onclick=()=>refresh();
+async function refresh(){ $('startPanel').style.display='none'; if(TAB==='files') return loadFiles(); return loadHistory(); }
+async function loadFiles(){
+  $('fileBox').innerHTML='<span class="mut">Loading...</span>';
+  try{ const r=await call('files'); FILES=r.files||[]; renderFiles(); }catch(e){ $('fileBox').innerHTML='<span class="mut">Could not load files: '+esc(e.message)+'</span>'; }
+}
+function renderFiles(){
+  if(!FILES.length){ $('fileBox').innerHTML='<span class="mut">No files on the printer.</span>'; return; }
+  const rows=FILES.slice().sort((a,b)=>(b.create_time||0)-(a.create_time||0)).map((f,i)=>{
+    const dots=(f.color_map||[]).map(c=>'<i style="background:'+esc(c.color)+'" title="T'+esc(c.t)+' '+esc(c.name)+'"></i>').join('');
+    return '<tr><td class="n" title="'+esc(f.filename)+'">'+esc(f.filename)+'</td><td>'+fmtMB(f.size)+'</td><td>'+(f.layer||'-')+'</td><td>'+fmtS(f.print_time)+'</td><td>'+(f.total_filament_used?f.total_filament_used.toFixed(1)+' g':'-')+'</td><td class="dots">'+dots+'</td><td>'+fmtD(f.create_time)+'</td>'+
+      '<td style="white-space:nowrap"><button class="pri" data-p="'+i+'">Print</button> <button class="dng" data-d="'+i+'">Delete</button></td></tr>';
+  }).join('');
+  $('fileBox').innerHTML='<table><tr><th>File</th><th>Size</th><th>Layers</th><th>Time</th><th>Filament</th><th>Colours</th><th>Created</th><th></th></tr>'+rows+'</table>';
+  const sorted=FILES.slice().sort((a,b)=>(b.create_time||0)-(a.create_time||0));
+  $('fileBox').querySelectorAll('[data-p]').forEach(b=>b.onclick=()=>openStart(sorted[+b.dataset.p]));
+  $('fileBox').querySelectorAll('[data-d]').forEach(b=>b.onclick=()=>askDelete(sorted[+b.dataset.d]));
+}
+function askDelete(f){
+  const p=$('startPanel'); p.style.display='block';
+  p.innerHTML='Delete <b>'+esc(f.filename)+'</b> from the printer? <button class="dng" id="yDel">Yes, delete</button> <button id="nDel">No</button>';
+  $('nDel').onclick=()=>{p.style.display='none';};
+  $('yDel').onclick=async()=>{ p.style.display='none'; try{ await run('Deleted',1047,{storage_media:'local',file_path:[f.filename]}); loadFiles(); }catch(e){} };
+}
+async function openStart(f){
+  const p=$('startPanel'); p.style.display='block'; p.innerHTML='Reading filament slots...';
+  if(!CANVAS){ await loadCanvas(); }
+  const trays=[]; for(const c of ((CANVAS&&CANVAS.canvas_list)||[])){ if(!c.connected) continue; for(const t of (c.tray_list||[])) trays.push({c:c.canvas_id,t:t.tray_id,type:t.filament_type||'',color:t.filament_color||'',name:t.filament_name||''}); }
+  const tools=(f.color_map&&f.color_map.length)?f.color_map:[{t:0,color:'',name:''}];
+  let html='<b>Print '+esc(f.filename)+'</b><div class="mut">Choose the slot for each filament in the file.</div>';
+  const used=new Set();
+  tools.forEach((tl,i)=>{
+    let guess=trays.findIndex((x,j)=>!used.has(j)&&x.type&&tl.name&&x.type.toUpperCase()===String(tl.name).toUpperCase());
+    if(guess<0) guess=trays.findIndex((x,j)=>!used.has(j));
+    if(guess>=0) used.add(guess);
+    html+='<div class="row"><span style="min-width:150px">T'+esc(tl.t)+' '+esc(tl.name||'')+' '+(tl.color?'<i style="display:inline-block;width:12px;height:12px;border-radius:50%;background:'+esc(tl.color)+';border:1px solid #0003"></i>':'')+'</span><select data-t="'+esc(tl.t)+'">'+
+      trays.map((x,j)=>'<option value="'+j+'"'+(j===(guess>=0?guess:Math.min(i,trays.length-1))?' selected':'')+'>'+(trays.length>0&&CANVAS.canvas_list.filter(c=>c.connected).length>1?'C'+x.c+' ':'')+'slot '+(x.t+1)+' - '+esc(x.type||'empty')+'</option>').join('')+'</select></div>';
+  });
+  html+='<div class="row"><label class="sw"><input type="checkbox" id="chkLevel"> Auto bed leveling</label></div><div class="row"><button class="pri" id="yPrint">Start print</button> <button id="nPrint">Cancel</button></div>';
+  p.innerHTML=html; $('nPrint').onclick=()=>{p.style.display='none';};
+  $('yPrint').onclick=async()=>{
+    const slots=[...p.querySelectorAll('select[data-t]')].map(s=>({t:+s.dataset.t,canvas_id:trays[+s.value].c,tray_id:trays[+s.value].t}));
+    if(!slots.length||slots.some(s=>s.canvas_id===undefined)) return note('No filament slot available','bad');
+    p.style.display='none'; try{ await run('Print started','start_file',{filename:f.filename,slots,leveling:$('chkLevel')?$('chkLevel').checked:false}); }catch(e){}
+  };
+}
+async function loadHistory(){
+  $('fileBox').innerHTML='<span class="mut">Loading...</span>';
+  try{
+    const r=await call('history'); const list=r.history_task_list||r.task_list||r.list||[];
+    if(!list.length){ $('fileBox').innerHTML='<span class="mut">No print history.</span>'; return; }
+    const rows=list.map(h=>{
+      const name=h.task_name||h.taskName||h.filename||h.file_name||'-', b=h.begin_time||h.beginTime||h.start_time, e=h.end_time||h.endTime;
+      const st=h.task_status!=null?h.task_status:(h.status!=null?h.status:'');
+      return '<tr><td class="n" title="'+esc(name)+'">'+esc(name)+'</td><td>'+fmtD(b)+'</td><td>'+fmtD(e)+'</td><td>'+esc(st)+'</td></tr>';
+    }).join('');
+    $('fileBox').innerHTML='<table><tr><th>Task</th><th>Started</th><th>Ended</th><th>Status</th></tr>'+rows+'</table>';
+  }catch(e){ $('fileBox').innerHTML='<span class="mut">Could not load history: '+esc(e.message)+'</span>'; }
+}
+
+if(typeof AgoraRTM==='undefined'){ setChip('cRtm','RTM: SDK not loaded','bad'); L('AgoraRTM script failed to load'); }
 P({type:'ready'});
-</script>"""
+setTimeout(loadAccount,600);
+</script>
+"""
 
 
 class CC2Page(orca.pages.PagesPluginCapabilityBase):
@@ -1057,11 +1694,7 @@ class CC2Page(orca.pages.PagesPluginCapabilityBase):
 class ElegooCC2Plugin(orca.base):
     def register_capabilities(self):
         try:
-            orca.request_permissions(
-                fs_read=[USER_INFO],
-                network_http=[BASE + "/", "https://iot.elegoo.com/"],
-                threading=True,
-            )
+            orca.request_permissions(threading=True)
         except Exception as e:
             HUB.log("request_permissions failed: %r" % e)
         orca.register_capability(CC2Page)
