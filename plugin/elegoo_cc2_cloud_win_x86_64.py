@@ -596,15 +596,17 @@ def _prefs_get():
         d = json.loads(_read_bytes(PREFS_FILE).decode("utf-8"))
     except Exception:
         d = {}
-    return {"theme": d.get("theme") if d.get("theme") in THEMES else "simple-dark", "cam": d.get("cam") is not False}
+    return {"theme": d.get("theme") if d.get("theme") in THEMES else "simple-dark", "cam": d.get("cam") is not False, "autostart": d.get("autostart") is not False}
 
 
-def _prefs_set(theme=None, cam=None):
+def _prefs_set(theme=None, cam=None, autostart=None):
     d = _prefs_get()
     if theme in THEMES:
         d["theme"] = theme
     if cam is not None:
         d["cam"] = bool(cam)
+    if autostart is not None:
+        d["autostart"] = bool(autostart)
     os.makedirs(os.path.dirname(PREFS_FILE), exist_ok=True)
     with open(PREFS_FILE, "w", encoding="utf-8") as f:
         json.dump(d, f)
@@ -979,7 +981,7 @@ class Hub:
         if m == "prefs_get":
             return _prefs_get()
         if m == "prefs_set":
-            return _prefs_set(p.get("theme"), p.get("cam"))
+            return _prefs_set(p.get("theme"), p.get("cam"), p.get("autostart"))
         if m == "open_url":
             url = str(p.get("url", ""))
             if url not in OPEN_OK:
@@ -1842,8 +1844,52 @@ class LanBridge(LoginProxy):
             HUB.log("bridge upload failed: %s" % e)
             return self._json(c, {"error_code": -1, "message": str(e)[:200]})
         HUB._log_entry("Orca upload", "%s (%.1f MB)" % (name, len(data) / 1048576.0), True, "", (time.time() - t0) * 1000)
-        HUB._post({"type": "note", "text": "Received %s from Orca - press Print on it in Printer files" % name, "kind": "ok"})
+        if _prefs_get().get("autostart"):
+            threading.Thread(target=self._autostart, args=(name, data), daemon=True, name="cc2-autostart").start()
+        else:
+            HUB._post({"type": "note", "text": "Received %s from Orca - press Print on it in Printer files" % name, "kind": "ok"})
         return self._json(c, {"error_code": 0, "message": "OK"})
+
+    @staticmethod
+    def _filament_types(data):
+        import re
+        m = re.search(rb"; filament_type = ([^\r\n]*)", data[-200000:])
+        return [x.strip().upper() for x in m.group(1).decode("latin-1").split(";")] if m else []
+
+    def _autostart(self, name, data):
+        HUB.tl.src = "orca"
+        t0 = time.time()
+        try:
+            time.sleep(2)
+            HUB.request(1002, {}, timeout=15)
+            for _ in range(20):                      # the printer may still be finishing the download
+                if HUB.is_idle():
+                    break
+                time.sleep(2)
+                HUB.request(1002, {}, timeout=15)
+            else:
+                raise RuntimeError("the printer is not idle, so the print was not started (press Print in Printer files)")
+            r = HUB.request(2005, {}, timeout=15)
+            trays = []
+            for cv in _dict(r.get("canvas_info")).get("canvas_list", []):
+                if cv.get("connected"):
+                    for t in cv.get("tray_list", []):
+                        trays.append((cv.get("canvas_id", 0), t.get("tray_id", 0), str(t.get("filament_type", "")).upper()))
+            types = self._filament_types(data) or ["PLA"]
+            slots, used = [], set()
+            for i, ft in enumerate(types):
+                pick = next((t for t in trays if t[2] == ft and (t[0], t[1]) not in used), None) or                        next((t for t in trays if (t[0], t[1]) not in used), None) or (trays[0] if trays else None)
+                if pick:
+                    used.add((pick[0], pick[1]))
+                    slots.append({"t": i, "canvas_id": pick[0], "tray_id": pick[1]})
+            HUB.log("auto-start slot map: %s (filament types %s)" % (slots, types))
+            cfg = {"delay_video": False, "printer_check": False, "print_layout": "A", "bedlevel_force": False, "slot_map": slots}
+            HUB.request(1020, {"filename": name, "storage_media": "local", "config": cfg}, timeout=30)
+            HUB._poke_status()
+            HUB._post({"type": "note", "text": "Print started: %s" % name, "kind": "ok"})
+        except Exception as e:
+            HUB._log_entry("Auto-start print", name, False, str(e), (time.time() - t0) * 1000)
+            HUB._post({"type": "note", "text": "Auto-start failed: %s" % e, "kind": "bad"})
 
     def _to_cloud(self, name, data):
         url, md5hex = upload_gcode(data, name)
@@ -2369,7 +2415,7 @@ PAGE_HTML = r"""<!doctype html><meta charset="utf-8">
   </div>
 
   <div class="card" style="grid-column:1/-1">
-    <div class="toolbar"><div class="tabs"><button id="tFiles" class="sel">Printer files</button><button id="tHist">Print history</button></div><span style="display:flex;gap:8px;align-items:center"><button id="bSend" title="Pick a .gcode exported from Orca and upload it to the printer">Send G-code...</button><button id="bFiles" class="ico" title="Reload (also automatic)">&#8635;</button></span></div>
+    <div class="toolbar"><div class="tabs"><button id="tFiles" class="sel">Printer files</button><button id="tHist">Print history</button></div><span style="display:flex;gap:8px;align-items:center"><label class="sw" title="When Orca uploads a file with Print, start it on the printer by itself (filament slots are matched by type)"><input type="checkbox" id="autoPrint"> Start after Orca upload</label><button id="bSend" title="Pick a .gcode exported from Orca and upload it to the printer">Send G-code...</button><button id="bFiles" class="ico" title="Reload (also automatic)">&#8635;</button></span></div>
     <div id="startPanel" class="panel" style="display:none"></div>
     <div id="fileBox"><span class="mut">Reading the file list...</span></div>
   </div>
@@ -2495,7 +2541,7 @@ async function handle(m){
   else if(m.type==='note'){ note(m.text,m.kind); }
   else if(m.type==='samples'){ for(const s of (m.items||[])) SAMPLES.push(s); if(SAMPLES.length>1800) SAMPLES.splice(0,SAMPLES.length-1800); scheduleDraw(); }
   else if(m.type==='cmdlog'){ (m.items||[]).forEach(addCmd); }
-  else if(m.type==='prefs'){ PREFS={theme:m.theme||'simple-dark',cam:m.cam!==false}; applyTheme(); }
+  else if(m.type==='prefs'){ PREFS={theme:m.theme||'simple-dark',cam:m.cam!==false,autostart:m.autostart!==false}; applyTheme(); }
   else if(m.type==='connstat'){ const e=$('aStat'); e.textContent=m.text; e.style.color=m.kind==='bad'?'var(--bad)':(m.kind==='ok'?'var(--ok)':''); }
   else if(m.type==='account'){ renderAccount(m); }
   else if(m.type==='conn'){ setChip('cPr','Printer: '+(m.printer?'online':'offline'),m.printer?'ok':'bad'); if(m.msg) note(m.msg,m.printer?'ok':'bad'); if(!m.printer){ $('ctl').classList.add('off'); $('ctlHint').style.display='block'; $('aStat').textContent=m.msg||'Printer is offline in the Elegoo cloud'; $('aStat').style.color='var(--bad)'; } }
@@ -2508,9 +2554,10 @@ setInterval(()=>P({type:'pull'}),300);
 
 /* ---------- controls ---------- */
 /* ---------- theme, links ---------- */
-let PREFS={theme:'simple-dark',cam:true};
-function applyTheme(){ const t=['simple-dark','simple-light','0x'].includes(PREFS.theme)?PREFS.theme:'simple-dark'; document.documentElement.dataset.theme=t; $('thTheme').value=t; $('camAuto').checked=PREFS.cam!==false; try{ scheduleDraw(); }catch(e){} }
+let PREFS={theme:'simple-dark',cam:true,autostart:true};
+function applyTheme(){ const t=['simple-dark','simple-light','0x'].includes(PREFS.theme)?PREFS.theme:'simple-dark'; document.documentElement.dataset.theme=t; $('thTheme').value=t; $('camAuto').checked=PREFS.cam!==false; $('autoPrint').checked=PREFS.autostart!==false; try{ scheduleDraw(); }catch(e){} }
 $('thTheme').onchange=()=>{ PREFS.theme=$('thTheme').value; applyTheme(); call('prefs_set',PREFS).catch(()=>{}); };
+$('autoPrint').onchange=()=>{ PREFS.autostart=$('autoPrint').checked; call('prefs_set',PREFS).catch(()=>{}); };
 $('camAuto').onchange=()=>{ PREFS.cam=$('camAuto').checked; call('prefs_set',PREFS).catch(()=>{}); };
 applyTheme();
 document.addEventListener('click',e=>{ const a=e.target.closest&&e.target.closest('[data-open]'); if(a){ e.preventDefault(); call('open_url',{url:a.dataset.open}).catch(()=>note('Could not open the link','bad')); } });
