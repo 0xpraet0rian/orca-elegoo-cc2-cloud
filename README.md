@@ -15,6 +15,7 @@
   <img alt="Python" src="https://img.shields.io/badge/python-3.12%2B-3776ab?style=flat-square">
   <img alt="Platform" src="https://img.shields.io/badge/platform-Windows-0078d4?style=flat-square">
   <img alt="Dependencies" src="https://img.shields.io/badge/dependencies-none-4cc38a?style=flat-square">
+  <img alt="License" src="https://img.shields.io/badge/license-PolyForm%20NC%201.0.0-b45309?style=flat-square">
   <img alt="Status" src="https://img.shields.io/badge/status-v0.5%20experimental-f59e0b?style=flat-square">
 </p>
 
@@ -148,6 +149,16 @@ assets/    icon (SVG, PNG, WebP, JPEG)
 docs/      protocol notes
 plugin/    the installable plugin
 ```
+
+## License
+
+[PolyForm Noncommercial 1.0.0](LICENSE). You may use, study and modify the plugin for **personal and other
+non-commercial purposes**. You may **not sell it, bundle it into a paid product or service, or use it commercially**,
+and copies you share must keep the license and the notice in [LICENSE](LICENSE). This is a source-available license,
+not an OSI open-source one.
+
+Third-party parts keep their own terms: the Agora web SDKs are loaded from a CDN at runtime under Agora's terms, and
+the protocol knowledge comes from the public Apache-2.0 `elegoo-link` sources (no code copied).
 
 ## Credits and disclaimer
 

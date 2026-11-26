@@ -5,11 +5,14 @@
 # [tool.orcaslicer.plugin]
 # name = "Elegoo CC2 Cloud"
 # description = "Send gcode to and control an Elegoo Centauri Carbon 2 from OrcaSlicer through the Elegoo cloud: upload, start/pause/stop, live status. Reuses your ElegooSlicer login (close ElegooSlicer while connected)."
-# author = "personal use"
+# author = "0xpraet0rian"
 # version = "0.5.0"
 # ///
 """
 Elegoo Centauri Carbon 2 - cloud printer agent for OrcaSlicer 2.5.x
+
+License: PolyForm Noncommercial 1.0.0 (personal and other non-commercial use only; no selling, no commercial use).
+Copyright (c) 2026 0xpraet0rian, https://github.com/0xpraet0rian
 
 Architecture
   * Python  : agent (discovery, connect, status mapping, upload, print), HTTP to matrix.elegoo.com

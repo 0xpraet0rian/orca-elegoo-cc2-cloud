@@ -1,0 +1,135 @@
+================================================================================
+  ELEGOO CC2 CLOUD                                                    v0.5.0
+  OrcaSlicer plugin for the Elegoo Centauri Carbon 2, over the Elegoo cloud
+================================================================================
+
+Print from OrcaSlicer's own Print button, control the printer and watch its
+camera from OrcaSlicer 2.5.x, without ElegooSlicer and without LAN mode.
+
+  Printer ........ Elegoo Centauri Carbon 2 (with or without Canvas)
+  Orca ........... 2.5.x, Windows
+  Needs .......... an Elegoo account, nothing to install (one Python file)
+  Status ......... experimental, built and tested against one printer
+
+
+--------------------------------------------------------------------------------
+  WHAT IT DOES
+--------------------------------------------------------------------------------
+
+  PRINT FROM ORCA
+    Slice, press Print. The file goes to the Elegoo cloud, the printer
+    downloads it and the print starts by itself. Filament slots are matched
+    by filament type (PLA goes to a PLA slot).
+
+  SEND G-CODE
+    A button in the plugin tab: pick a .gcode or .gcode.3mf with the Windows
+    file dialog and upload it, without using Orca's Print button.
+
+  CONTROL TAB
+    Pause, resume, stop, print speed. Nozzle and bed temperatures. Motion
+    and homing with an X / Y / Z read-out. Fans and light. Canvas filament
+    load and unload. Printer files and print history with page buttons.
+
+  CAMERA
+    Live view, starts by itself, resizable or full screen.
+
+  GRAPHS AND CONSOLE
+    Temperature graph next to the temperatures, fan graph next to the fans
+    (5 min, 30 min or 2 h). A console lists every command sent to the printer
+    with its result and how long it took.
+
+  OWN SIGN-IN
+    You sign in with Elegoo's own page. The session is stored encrypted
+    (Windows DPAPI) and survives reinstalling the plugin.
+
+  EXTRAS
+    Three themes (Simple dark, Simple white, 0xpraet0rian), a Guide pop-up,
+    automatic reconnection, automatic refresh of slots, files and history.
+
+
+--------------------------------------------------------------------------------
+  SETUP (once)
+--------------------------------------------------------------------------------
+
+  1. Orca > Preferences > Developer > Experimental features:
+     turn on "Use printer agents instead of print hosts".
+
+  2. Plugins > Install local plugin:
+     choose elegoo_cc2_cloud_win_x86_64.py and accept the permissions.
+
+  3. In the printer preset (Printer settings > Basic information >
+     Advanced) set Printer Agent to "Elegoo CC2 (cloud)".
+
+  4. Open the "Elegoo CC2" tab and press "Sign in with Elegoo".
+     The tab then connects by itself. Keep the tab open while you print.
+
+  5. To make Orca's Print button work, add a physical printer (icon next to
+     the printer name in the Printer panel):
+
+         Host Type ....... Elegoo Link
+         Hostname ........ 127.0.0.1:47890
+         API key ......... empty (or 123456)
+
+     Press Test, it should succeed, then select that printer.
+
+
+--------------------------------------------------------------------------------
+  PRINTING
+--------------------------------------------------------------------------------
+
+  1. Slice your plate.
+  2. Press Print.
+  3. Orca sits at about 99% for one to two minutes while the file goes to
+     the cloud and the printer downloads it. That is normal.
+  4. The print starts by itself. Progress is in the plugin tab.
+
+  Prefer to choose the filament slots yourself? Untick "Start after Orca
+  upload" in the Files bar, then press Print on the file in "Printer files".
+
+
+--------------------------------------------------------------------------------
+  GOOD TO KNOW
+--------------------------------------------------------------------------------
+
+  - One cloud session per Elegoo account. Close ElegooSlicer while this
+    plugin is connected.
+  - The plugin tab must stay open: it holds the connection to the printer.
+  - Orca's built-in Elegoo Link only uploads the file for this printer and
+    never starts it, so the plugin plays the printer on 127.0.0.1 and does the
+    upload and the start itself.
+  - LAN mode is not supported. Files of 500 MB or more are not supported.
+  - Windows only.
+
+  If something fails, look at the Command console in the tab:
+    "Another session"        ElegooSlicer or an old tab is still connected.
+    "Offline in the cloud"   the printer is off or has no Wi-Fi.
+
+
+--------------------------------------------------------------------------------
+  PRIVACY
+--------------------------------------------------------------------------------
+
+  - Your password passes through the plugin on its way to Elegoo's sign-in
+    page. It is never stored or logged. Only the session Elegoo returns is
+    kept, encrypted with Windows DPAPI.
+  - The plugin listens on 127.0.0.1:47890 only. Requests with another Host
+    header are refused.
+  - Traffic goes to the Elegoo cloud and Agora (the cloud's messaging and
+    video service). The Agora scripts load from cdn.jsdelivr.net.
+
+
+--------------------------------------------------------------------------------
+  CREDITS
+--------------------------------------------------------------------------------
+
+  Plugin by 0xpraet0rian  https://0xpraet0rian.github.io/
+  Protocol worked out from the public elegoo-link sources (Apache-2.0), the
+  OrcaSlicer plugin documentation and traffic from the author's own printer.
+
+  License: PolyForm Noncommercial 1.0.0. Free for personal and other
+  non-commercial use; selling or commercial use is not allowed.
+
+  Personal project, not affiliated with or endorsed by Elegoo or the
+  OrcaSlicer project. Use at your own risk: it can start prints, move axes
+  and heat the printer.
+================================================================================
