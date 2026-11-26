@@ -1696,46 +1696,71 @@ ICON_SVG = r"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" wid
 
 PAGE_HTML = r"""<!doctype html><meta charset="utf-8">
 <style>
- :root{--bg:var(--orca-bg,#f4f6f8);--fg:var(--orca-fg,#1f2933);--mut:var(--orca-muted,#6b7785);--acc:var(--orca-accent,#0f766e);--bd:var(--orca-border,#d5dbe1);--card:#fff;--bad:#c0392b;--ok:#0f766e;--warn:#b7791f}
- *{box-sizing:border-box} body{font:13px var(--orca-font,'Segoe UI',sans-serif);color:var(--fg);background:var(--bg);margin:0;padding:14px}
- h3{margin:0;font-size:15px} .mut{color:var(--mut)} .grid{display:grid;gap:12px}
- .top{display:flex;gap:14px;align-items:center;flex-wrap:wrap;margin-bottom:12px}
- .top .name{font-size:18px;font-weight:600} .chips{display:flex;gap:6px;flex-wrap:wrap}
- .chip{padding:2px 9px;border-radius:999px;border:1px solid var(--bd);background:var(--card);font-size:12px}
- .chip.ok{border-color:var(--ok);color:var(--ok)} .chip.bad{border-color:var(--bad);color:var(--bad)} .chip.warn{border-color:var(--warn);color:var(--warn)}
- .cols{display:grid;gap:12px;grid-template-columns:repeat(2,minmax(0,1fr));align-items:stretch}
- @media (max-width:760px){.cols{grid-template-columns:1fr}}
- .card{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:12px 14px}
- .card{display:flex;flex-direction:column} .card>h3{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
- button{font:inherit;padding:5px 11px;border:1px solid var(--bd);border-radius:6px;background:#fff;color:var(--fg);cursor:pointer}
- button:hover:not(:disabled){border-color:var(--acc);color:var(--acc)} button:disabled{opacity:.45;cursor:not-allowed}
- button.pri{background:var(--acc);border-color:var(--acc);color:#fff} button.pri:hover:not(:disabled){color:#fff;filter:brightness(1.1)}
- button.dng{border-color:var(--bad);color:var(--bad)} button.sel{background:var(--acc);border-color:var(--acc);color:#fff}
- input[type=number],select{font:inherit;padding:4px 6px;border:1px solid var(--bd);border-radius:6px;background:#fff;color:var(--fg)}
- input[type=number]{width:68px} .row{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:6px 0}
- .bar{height:8px;border-radius:5px;background:#e3e8ed;overflow:hidden} .bar>i{display:block;height:100%;background:var(--acc);width:0%}
- .kv{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin:10px 0} .kv div{display:flex;flex-direction:column}
- .k{font-size:11px;text-transform:uppercase;color:var(--mut)} .v{font-weight:600}
- .pad{display:grid;grid-template-columns:repeat(3,44px);grid-template-rows:repeat(3,38px);gap:5px} .pad button{padding:0}
- .zcol{display:flex;flex-direction:column;gap:5px} .zcol button{width:44px;height:38px;padding:0}
- .slots{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:6px 0}
- .slot{border:2px solid var(--bd);border-radius:10px;padding:8px 4px;text-align:center;cursor:pointer;background:#fff}
- .slot.on{border-color:var(--acc);box-shadow:0 0 0 2px rgba(15,118,110,.18)} .slot .dot{width:34px;height:34px;border-radius:50%;margin:0 auto 4px;border:1px solid #0003}
- .slot small{display:block;color:var(--mut)} .slot.empty .dot{background:repeating-linear-gradient(45deg,#eee,#eee 4px,#fff 4px,#fff 8px)}
- table{width:100%;border-collapse:collapse} th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--bd);vertical-align:middle}
- th{font-size:11px;text-transform:uppercase;color:var(--mut)} td.n{max-width:360px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
- .tabs{display:flex;gap:6px} .dots i{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:3px;border:1px solid #0003}
- .toolbar{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;flex-wrap:wrap;gap:8px}
- #note{position:sticky;top:0;z-index:5;margin:0 0 10px;padding:8px 12px;border-radius:8px;display:none;border:1px solid var(--bd);background:#fff}
+ :root{--bg:var(--orca-bg,#f2f4f7);--fg:var(--orca-fg,#1d2733);--mut:var(--orca-muted,#677485);--acc:var(--orca-accent,#0f766e);
+  --bd:var(--orca-border,#d9dfe6);--card:#ffffff;--ctl:#ffffff;--soft:#eaeff3;--bad:#c0392b;--ok:#0f766e;--warn:#b7791f;
+  --r:14px;--sh:0 1px 2px rgba(16,24,40,.05),0 2px 8px rgba(16,24,40,.06)}
+ @media (prefers-color-scheme:dark){:root{--bg:var(--orca-bg,#1b1f23);--fg:var(--orca-fg,#e7ebef);--mut:var(--orca-muted,#8c98a5);
+  --bd:var(--orca-border,#38414a);--card:#242a30;--ctl:#2c343b;--soft:#303941;--bad:#ef6b5d;--ok:#35c2b3;--warn:#e0b04a;--sh:0 1px 2px rgba(0,0,0,.35)}}
+ *{box-sizing:border-box}
+ body{font:13px/1.45 var(--orca-font,'Segoe UI',system-ui,sans-serif);color:var(--fg);background:var(--bg);margin:0;padding:16px;max-width:1320px;margin-inline:auto}
+ h3{margin:0;font-size:12px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;color:var(--mut)}
+ .mut{color:var(--mut)} b{font-weight:600}
+ .top{display:flex;gap:14px;align-items:center;flex-wrap:wrap;margin-bottom:14px}
+ .top svg{flex:none;border-radius:9px;box-shadow:var(--sh)}
+ .top .name{font-size:20px;font-weight:650;line-height:1.15} .chips{display:flex;gap:6px;flex-wrap:wrap;margin-left:auto}
+ .chip{display:inline-flex;align-items:center;gap:6px;padding:3px 10px;border-radius:999px;border:1px solid var(--bd);background:var(--card);font-size:12px;white-space:nowrap}
+ .chip::before{content:"";width:7px;height:7px;border-radius:50%;background:var(--mut);opacity:.6}
+ .chip.ok{border-color:var(--ok);color:var(--ok)} .chip.ok::before{background:var(--ok);opacity:1}
+ .chip.bad{border-color:var(--bad);color:var(--bad)} .chip.bad::before{background:var(--bad);opacity:1}
+ .chip.warn{border-color:var(--warn);color:var(--warn)} .chip.warn::before{background:var(--warn);opacity:1}
+ .cols{display:grid;gap:14px;grid-template-columns:repeat(2,minmax(0,1fr));align-items:stretch;transition:opacity .2s}
+ @media (max-width:820px){.cols{grid-template-columns:1fr}}
+ .card{display:flex;flex-direction:column;background:var(--card);border:1px solid var(--bd);border-radius:var(--r);padding:14px 16px;box-shadow:var(--sh)}
+ .card>h3{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:12px;min-height:26px}
+ .card>h3 .mut{text-transform:none;letter-spacing:0;font-weight:500;font-size:12px}
+ button{font:inherit;font-weight:500;padding:5px 12px;min-height:30px;border:1px solid var(--bd);border-radius:8px;background:var(--ctl);color:var(--fg);cursor:pointer;transition:background .12s,border-color .12s,transform .05s}
+ button:hover:not(:disabled){border-color:var(--acc);color:var(--acc)} button:active:not(:disabled){transform:translateY(1px)}
+ button:disabled{opacity:.42;cursor:not-allowed}
+ button.pri{background:var(--acc);border-color:var(--acc);color:#fff} button.pri:hover:not(:disabled){color:#fff;filter:brightness(1.08)}
+ button.dng{border-color:var(--bad);color:var(--bad)} button.dng:hover:not(:disabled){background:var(--bad);color:#fff}
+ button.sel{background:var(--acc);border-color:var(--acc);color:#fff}
+ input[type=number],select{font:inherit;padding:4px 8px;min-height:30px;border:1px solid var(--bd);border-radius:8px;background:var(--ctl);color:var(--fg)}
+ input[type=number]{width:72px} input[type=range]{accent-color:var(--acc);width:100%} input[type=checkbox]{accent-color:var(--acc)}
+ .row{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:6px 0}
+ .bar{height:10px;border-radius:6px;background:var(--soft);overflow:hidden} .bar>i{display:block;height:100%;background:var(--acc);width:0%;transition:width .4s}
+ .kv{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin:12px 0} .kv div{display:flex;flex-direction:column}
+ .k{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--mut)} .v{font-weight:600;font-size:15px}
+ .pad{display:grid;grid-template-columns:repeat(3,46px);grid-template-rows:repeat(3,40px);gap:6px} .pad button{padding:0}
+ .zcol{display:flex;flex-direction:column;gap:6px} .zcol button{width:46px;height:40px;padding:0}
+ .slots{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin:6px 0}
+ .slot{border:2px solid var(--bd);border-radius:12px;padding:10px 4px;text-align:center;cursor:pointer;background:var(--ctl);transition:border-color .12s,box-shadow .12s}
+ .slot:hover{border-color:var(--acc)} .slot.on{border-color:var(--acc);box-shadow:0 0 0 3px rgba(15,118,110,.2)}
+ .slot .dot{width:36px;height:36px;border-radius:50%;margin:0 auto 5px;border:1px solid #0003}
+ .slot small{display:block;color:var(--mut)} .slot.empty .dot{background:repeating-linear-gradient(45deg,#ddd,#ddd 4px,#fff 4px,#fff 8px)}
+ table{width:100%;border-collapse:collapse} th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--bd);vertical-align:middle}
+ tr:hover td{background:var(--soft)} th{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--mut);font-weight:600}
+ td.n{max-width:380px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+ .tabs{display:flex;gap:6px;align-items:center} .dots i{display:inline-block;width:11px;height:11px;border-radius:50%;margin-right:3px;border:1px solid #0003}
+ .toolbar{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;flex-wrap:wrap;gap:8px}
+ #note{position:sticky;top:0;z-index:5;margin:0 0 12px;padding:9px 14px;border-radius:10px;display:none;border:1px solid var(--bd);background:var(--card);box-shadow:var(--sh)}
  #note.bad{border-color:var(--bad);color:var(--bad)} #note.ok{border-color:var(--ok);color:var(--ok)}
- .cols.off{opacity:.4;pointer-events:none;filter:grayscale(.4)}
- .panel{border:1px dashed var(--acc);border-radius:8px;padding:10px;margin:8px 0;background:#f1faf9}
- .sw{display:inline-flex;align-items:center;gap:6px} details pre{background:#0001;padding:8px;max-height:220px;overflow:auto;white-space:pre-wrap;border-radius:6px}
- .rng{display:grid;grid-template-columns:90px 1fr 44px;gap:8px;align-items:center;margin:6px 0}
+ .cols.off{opacity:.38;pointer-events:none;filter:grayscale(.5)}
+ .panel{border:1px dashed var(--acc);border-radius:10px;padding:12px;margin:10px 0;background:var(--soft)}
+ .sw{display:inline-flex;align-items:center;gap:6px;cursor:pointer}
+ details pre{background:var(--soft);padding:10px;max-height:240px;overflow:auto;white-space:pre-wrap;border-radius:8px;font:12px/1.4 ui-monospace,Consolas,monospace}
+ summary{cursor:pointer;padding:6px 2px}
+ .rng{display:grid;grid-template-columns:92px 1fr 46px;gap:10px;align-items:center;margin:8px 0} .rng b{text-align:right}
+ /* camera: drag the corner to resize; presets and full screen on the toolbar */
+ #camWrap{display:none;position:relative;resize:both;overflow:hidden;width:min(100%,720px);height:405px;min-width:260px;min-height:160px;max-width:100%;
+  background:#000;border-radius:12px;margin:0 auto;border:1px solid var(--bd)}
+ #camBox{position:absolute;inset:0} #camBox video{object-fit:contain !important}
+ #camBar{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+ #camMsg{min-height:18px;margin-top:8px;text-align:center}
 </style>
 
 <div id="note"></div>
 <div class="top">
+  <svg width="40" height="40" viewBox="0 0 128 128" aria-hidden="true"><rect width="128" height="128" rx="26" fill="#0f766e"/><path transform="translate(0 4)" d="M40 58a15 15 0 0 1 14-20 20 20 0 0 1 37 6 13 13 0 0 1-1 26H44a12 12 0 0 1-4-12z" fill="#ccfbf1"/><rect x="34" y="66" width="60" height="44" rx="5" fill="none" stroke="#f0fdfa" stroke-width="5"/><line x1="34" y1="80" x2="94" y2="80" stroke="#f0fdfa" stroke-width="4"/><rect x="58" y="76" width="12" height="9" rx="2" fill="#5eead4"/><path d="M61 85h6l-3 6z" fill="#5eead4"/></svg>
   <div><div class="name" id="pname">Elegoo CC2</div><div class="mut" id="pinfo"></div></div>
   <div class="chips"><span class="chip" id="cRtm">RTM: starting</span><span class="chip" id="cPr">Printer: -</span><span class="chip" id="cSt">-</span></div>
 </div>
@@ -1808,9 +1833,9 @@ PAGE_HTML = r"""<!doctype html><meta charset="utf-8">
   </div>
 
   <div class="card" style="grid-column:1/-1">
-    <h3>Camera <span><span class="mut" id="camSt"></span> <button id="bCam">Turn on</button></span></h3>
-    <div id="camBox" style="display:none;background:#000;border-radius:8px;aspect-ratio:16/9;max-height:520px;overflow:hidden"></div>
-    <div class="mut" id="camHint">Live view from the printer camera (needs the cloud account; one viewer per account).</div>
+    <h3>Camera <span id="camBar"><span class="tabs" id="camSizes" style="display:none"><button data-w="360">S</button><button data-w="560">M</button><button data-w="800">L</button><button data-w="0" title="Fit the card width">Fit</button><button id="bFull" title="Full screen">Full screen</button></span> <button id="bCam" class="pri">Turn on</button></span></h3>
+    <div id="camWrap" title="Drag the bottom-right corner to resize"><div id="camBox"></div></div>
+    <div class="mut" id="camMsg">Live view from the printer camera (needs the cloud account; one viewer per account). Drag the bottom-right corner of the picture to resize it.</div>
   </div>
 
   <div class="card" style="grid-column:1/-1">
@@ -1979,35 +2004,45 @@ for(const [id,key,lab] of [['fModel','fan','vModel'],['fAux','aux_fan','vAux'],[
 $('light').onchange=e=>{ dragging='light'; run('Light '+(e.target.checked?'on':'off'),1029,{power:e.target.checked?1:0}).catch(()=>{}).finally(()=>{dragging=null;}); };
 
 /* ---------- camera (Agora RTC, same flow as ElegooSlicer: live/vp8, channel = printer serial) ---------- */
-let CAM=null, CAMON=false;
+let CAM=null, CAMON=false, PLAYING=false, SUBS=new Set(), CAMERR='';
 (function(){ try{ if(!navigator.mediaDevices){ navigator.mediaDevices={}; }
   if(typeof navigator.mediaDevices.enumerateDevices!=='function') navigator.mediaDevices.enumerateDevices=()=>Promise.resolve([]);
   if(typeof navigator.mediaDevices.getUserMedia!=='function') navigator.mediaDevices.getUserMedia=()=>Promise.reject(new Error('no capture devices')); }catch(e){} })();
-function camMsg(t,bad){ $('camSt').textContent=t||''; $('camSt').style.color=bad?'var(--bad)':''; }
+function camMsg(t,bad){ const e=$('camMsg'); e.textContent=t||''; e.style.color=bad?'var(--bad)':''; }
+const errText=e=>((e&&e.code)?e.code+': ':'')+((e&&e.message)||String(e));
 async function camStop(){
-  CAMON=false; $('bCam').textContent='Turn on'; $('camBox').style.display='none'; $('camBox').innerHTML=''; camMsg('');
-  if(CAM){ try{ CAM.removeAllListeners(); await CAM.leave(); }catch(e){} CAM=null; }
+  CAMON=false; PLAYING=false; SUBS.clear(); $('bCam').textContent='Turn on'; $('bCam').className='pri';
+  $('camWrap').style.display='none'; $('camSizes').style.display='none'; $('camBox').innerHTML='';
+  if(CAM){ const c=CAM; CAM=null; try{ c.removeAllListeners(); await c.leave(); }catch(e){} }
 }
 async function camStart(){
-  if(typeof AgoraRTC==='undefined'){ camMsg('RTC SDK not loaded',true); return; }
-  camMsg('connecting...'); $('bCam').disabled=true;
+  if(typeof AgoraRTC==='undefined'){ camMsg('The RTC SDK did not load (no internet access to cdn.jsdelivr.net?)',true); L('AgoraRTC script missing'); return; }
+  camMsg('Connecting to the camera...'); $('bCam').disabled=true; CAMERR=''; SUBS.clear(); PLAYING=false;
   try{
     const cfg=await call('cam_creds',{},30000);
     try{ AgoraRTC.setLogLevel(3); AgoraRTC.disableLogUpload&&AgoraRTC.disableLogUpload(); }catch(e){}
     const c=AgoraRTC.createClient({mode:'live',codec:'vp8'}); CAM=c;
-    const show=async(u)=>{ try{ await c.subscribe(u,'video'); if(u.videoTrack){ $('camBox').style.display='block'; $('camBox').innerHTML=''; u.videoTrack.play($('camBox')); camMsg('live'); } }catch(e){ camMsg('subscribe: '+((e&&e.message)||e),true); } };
-    c.on('user-published',async(u,m)=>{ if(m==='video') await show(u); });
-    c.on('user-unpublished',()=>camMsg('stream stopped'));
-    c.on('connection-state-change',(a,b)=>{ if(a==='DISCONNECTED'&&CAMON){ camMsg('disconnected',true); } });
+    // subscribe exactly once per remote user; transient subscribe errors are only logged, not shown
+    const show=async(u)=>{
+      if(SUBS.has(u.uid)) return; SUBS.add(u.uid);
+      try{ await c.subscribe(u,'video');
+        if(u.videoTrack){ $('camBox').innerHTML=''; $('camWrap').style.display='block'; $('camSizes').style.display='inline-flex'; u.videoTrack.play($('camBox'),{fit:'contain'}); PLAYING=true; camMsg('Live'); }
+      }catch(e){ SUBS.delete(u.uid); CAMERR=errText(e); L('camera subscribe: '+CAMERR); }
+    };
+    c.on('user-published',(u,m)=>{ if(m==='video') show(u); });
+    c.on('user-unpublished',(u)=>{ SUBS.delete(u.uid); PLAYING=false; camMsg('The stream stopped; waiting for the printer...'); });
+    c.on('connection-state-change',(a,b,r)=>{ L('camera link '+b+' -> '+a+(r?' ('+r+')':'')); if(a==='DISCONNECTED'&&CAMON) camMsg('Camera link lost',true); });
     await c.join(cfg.appId,String(cfg.channel),cfg.token,Number(cfg.uid));
     await c.setClientRole('host');
-    CAMON=true; $('bCam').textContent='Turn off';
-    for(let i=0;i<30&&CAMON;i++){ const u=c.remoteUsers.find(x=>x.hasVideo)||c.remoteUsers[0]; if(u){ await show(u); if(u.videoTrack) break; } await new Promise(r=>setTimeout(r,1000)); }
-    if(CAMON && !$('camBox').innerHTML) camMsg('no video from the printer (offline, or another viewer is connected)',true);
-  }catch(e){ camMsg((e&&e.message)||String(e),true); await camStop(); }
+    CAMON=true; $('bCam').textContent='Turn off'; $('bCam').className='';
+    for(let i=0;i<30&&CAMON&&!PLAYING;i++){ const u=c.remoteUsers.find(x=>x.hasVideo); if(u) await show(u); if(PLAYING) break; await new Promise(r=>setTimeout(r,1000)); }
+    if(CAMON&&!PLAYING) camMsg('No video from the printer'+(CAMERR?' ('+CAMERR+')':' (offline, or another viewer is connected)'),true);
+  }catch(e){ L('camera error: '+errText(e)); camMsg('Camera error: '+errText(e),true); await camStop(); }
   finally{ $('bCam').disabled=false; }
 }
 $('bCam').onclick=()=>{ CAMON?camStop():camStart(); };
+document.querySelectorAll('#camSizes button[data-w]').forEach(b=>b.onclick=()=>{ const w=+b.dataset.w, el=$('camWrap'); el.style.width=w?w+'px':'100%'; el.style.height=Math.round((w||el.parentElement.clientWidth)*9/16)+'px'; });
+$('bFull').onclick=()=>{ const el=$('camWrap'); try{ (el.requestFullscreen||el.webkitRequestFullscreen).call(el); }catch(e){ note('Full screen is not available here','bad'); } };
 
 /* ---------- filament / canvas ---------- */
 let CANVAS=null, SEL=null;
