@@ -15,7 +15,7 @@
   <img alt="Python" src="https://img.shields.io/badge/python-3.12%2B-3776ab?style=flat-square">
   <img alt="Platform" src="https://img.shields.io/badge/platform-Windows-0078d4?style=flat-square">
   <img alt="Dependencies" src="https://img.shields.io/badge/dependencies-none-4cc38a?style=flat-square">
-  <img alt="Status" src="https://img.shields.io/badge/status-v0.3.2%20experimental-f59e0b?style=flat-square">
+  <img alt="Status" src="https://img.shields.io/badge/status-v0.4%20experimental-f59e0b?style=flat-square">
 </p>
 
 ---
@@ -30,6 +30,9 @@
 | **Live status** | Progress, layers, temperatures, remaining time and the machine state, in the tab and in Orca |
 | **Multi-colour** | Filament slots come from Orca's mapping and are sent as the printer's `slot_map`; files started from the tab get a slot picker per colour |
 | **Auto-refresh** | Filament slots, files and history refresh after connecting, when a print ends, when the printer goes idle and every minute |
+| **Graphs** | Temperatures (with targets) next to the temperature controls and the three fans next to the fan controls, recorded while connected; 5 min, 30 min or 2 h, with a hover read-out |
+| **Command console** | Every command sent to the printer, from the tab or from Orca (motion, temperatures, fans, light, speed, filament, uploads, prints), with the result and how long it took |
+| **Paging** | Files and print history have page buttons and a page size |
 | **Own sign-in** | Signs in with Elegoo's own page in your browser; the session is stored encrypted (Windows DPAPI) and survives plugin reinstalls |
 | **Themes** | *Simple dark* (default), *Simple white* and *0xpraet0rian* (navy and orange); the choice is saved |
 | **No dependencies** | One Python file and the standard library; everything native goes through `ctypes` |

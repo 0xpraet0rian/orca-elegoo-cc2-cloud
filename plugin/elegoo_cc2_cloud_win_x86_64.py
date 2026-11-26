@@ -6,7 +6,7 @@
 # name = "Elegoo CC2 Cloud"
 # description = "Send gcode to and control an Elegoo Centauri Carbon 2 from OrcaSlicer through the Elegoo cloud: upload, start/pause/stop, live status. Reuses your ElegooSlicer login (close ElegooSlicer while connected)."
 # author = "personal use"
-# version = "0.3.2"
+# version = "0.4.0"
 # ///
 """
 Elegoo Centauri Carbon 2 - cloud printer agent for OrcaSlicer 2.5.x
@@ -464,6 +464,51 @@ def _dict(v):
     return v if isinstance(v, dict) else {}
 
 
+READ_ONLY = {1001, 1002, 1036, 1044, 2005}   # polling and reads are not shown in the console
+POKE = {1021, 1022, 1023, 1024, 1025, 1026, 1027, 1028, 1029, 1030, 1031, 2001, 2002, 2004, "start_file"}
+
+
+def _describe(method, p):
+    """(label, detail) of a command for the console."""
+    p = p if isinstance(p, dict) else {}
+    try:
+        if method == 1027:
+            return "Move", "%s %+g mm" % (str(p.get("axes", "")).upper(), float(p.get("distance", 0)))
+        if method == 1026:
+            return "Home", str(p.get("homed_axes", "")).upper()
+        if method == 1028:
+            if "extruder" in p:
+                return "Temperature", "nozzle target %s C" % p["extruder"]
+            if "heater_bed" in p:
+                return "Temperature", "bed target %s C" % p["heater_bed"]
+        if method == 1029:
+            return "Light", "on" if p.get("power") else "off"
+        if method == 1030:
+            names = {"fan": "model", "aux_fan": "assistance", "box_fan": "case"}
+            return "Fan", ", ".join("%s %d%%" % (names.get(k, k), round(float(v) * 100 / 255)) for k, v in p.items())
+        if method == 1031:
+            return "Print speed", {0: "Silent", 1: "Balanced", 2: "Sport", 3: "Ludicrous"}.get(p.get("mode"), str(p.get("mode")))
+        if method == 1020:
+            return "Start print", str(p.get("filename", ""))
+        if method in (1021, 1022, 1023):
+            return {1021: "Pause print", 1022: "Stop print", 1023: "Resume print"}[method], ""
+        if method in (1024, 1025):
+            return ("Feed" if method == 1024 else "Retract") + " filament", ""
+        if method in (2001, 2002):
+            return ("Load" if method == 2001 else "Unload") + " filament", "canvas %s, slot %d" % (p.get("canvas_id"), int(p.get("tray_id", 0)) + 1)
+        if method == 2004:
+            return "Auto refill", "on" if p.get("auto_refill") else "off"
+        if method == 1047:
+            return "Delete file", ", ".join(str(x) for x in (p.get("file_path") or []))
+        if method == 1057:
+            return "Send file to printer", str(p.get("filename", ""))
+        if method == 1058:
+            return "Cancel download", ""
+    except Exception:
+        pass
+    return "Command %s" % method, ""
+
+
 def _ms(v):
     try:
         v = float(v)
@@ -630,6 +675,13 @@ class Hub:
         self.devices = []
         self.login_proxy = None
         self.connect_lock = threading.Lock()
+        self.samples = collections.deque(maxlen=1800)     # [t_ms, nozzle, nozzle_t, bed, bed_t, chamber, model%, aux%, case%]
+        self.cmdlog = collections.deque(maxlen=400)       # commands sent to the printer (console)
+        self.cmd_id = 0
+        self.s_cursor = 0
+        self.c_cursor = 0
+        self.data_lock = threading.Lock()
+        self.tl = threading.local()                       # .src = "orca" for commands issued by Orca's own flows
         self.rtc = None
         self.cur_code = None
         self.status_ts = 0.0
@@ -680,6 +732,15 @@ class Hub:
         if self.out_status is not None:
             items.append(self.out_status)
             self.out_status = None
+        with self.data_lock:
+            new_s = [x for x in self.samples if x[0] > self.s_cursor]
+            new_c = [e for e in self.cmdlog if e["id"] > self.c_cursor]
+        if new_s:
+            items.append({"type": "samples", "items": new_s})
+            self.s_cursor = new_s[-1][0]
+        if new_c:
+            items.append({"type": "cmdlog", "items": new_c})
+            self.c_cursor = new_c[-1]["id"]
         if items and self.page is not None:
             try:
                 self.page.post_message({"type": "batch", "items": items})
@@ -703,6 +764,8 @@ class Hub:
             if t == "pull":
                 self._drain()
             elif t == "ready":
+                self.s_cursor = 0
+                self.c_cursor = 0
                 self.outbox.clear()
                 self.outlogs.clear()
                 self.out_status = None
@@ -815,6 +878,13 @@ class Hub:
         return n
 
     def _exec_ui(self, m, p):
+        res = self._exec_ui_locked(m, p)
+        mm = int(m) if str(m).isdigit() else m
+        if mm in POKE:
+            self._poke_status()
+        return res
+
+    def _exec_ui_locked(self, m, p):
         long_ops = (1024, 1025, 1026, 2001, 2002, "start_file")
         mm = int(m) if str(m).isdigit() else m
         if mm in long_ops:
@@ -904,7 +974,16 @@ class Hub:
         if m == "canvas":
             return self.request(2005, {}, timeout=15)
         if m == "history":
-            return self._history_http()
+            return self._history_http(int(_num(p.get("page"), 1)), int(_num(p.get("size"), 10)))
+        if m == "samples_clear":
+            with self.data_lock:
+                self.samples.clear()
+            self.s_cursor = 0
+            return {}
+        if m == "cmdlog_clear":
+            with self.data_lock:
+                self.cmdlog.clear()
+            return {}
         if m == "start_file":
             if not idle:
                 raise RuntimeError("the printer is not idle")
@@ -1134,10 +1213,11 @@ class Hub:
             page += 1
         return [f for f in out if f["filename"]]
 
-    def _history_http(self):
+    def _history_http(self, page=1, size=10):
         sn = self.sn or SESSION.get().get("sn", "")
+        page, size = max(1, page), min(100, max(5, size))
         d = _dict(_api("/api/v1/device-management-server/device/event-data/page",
-                       {"deviceCode": sn, "pageNo": 1, "pageSize": 50, "eventKey": "history_task",
+                       {"deviceCode": sn, "pageNo": page, "pageSize": size, "eventKey": "history_task",
                         "sort": "create_time,desc"}))
         tasks = []
         for it in d.get("list") or []:
@@ -1256,7 +1336,49 @@ class Hub:
         self._post({"type": "logout"})
 
     # ---- request/response over RTM
+    def _log_entry(self, label, detail, ok, err, ms, src=None):
+        with self.data_lock:
+            self.cmd_id += 1
+            self.cmdlog.append({"id": self.cmd_id, "t": int(time.time() * 1000), "src": src or getattr(self.tl, "src", "tab"),
+                                "label": label, "detail": detail or "", "ok": bool(ok), "err": (err or "")[:240], "ms": int(ms)})
+
     def request(self, method, params=None, timeout=20):
+        t0, err = time.time(), None
+        try:
+            return self._request(method, params, timeout)
+        except Exception as e:
+            err = str(e)
+            raise
+        finally:
+            if method not in READ_ONLY:
+                label, detail = _describe(method, params)
+                self._log_entry(label, detail, err is None, err, (time.time() - t0) * 1000)
+
+    def _record_sample(self):
+        s = self.status
+        ex, hb = _dict(s.get("extruder")), _dict(s.get("heater_bed"))
+        zt, fans = _dict(s.get("ztemperature_sensor")), _dict(s.get("fans"))
+
+        def pc(k):
+            return int(round(_num(_dict(fans.get(k)).get("speed")) * 100 / 255.0))
+        smp = [int(time.time() * 1000), _num(ex.get("temperature")), _num(ex.get("target")), _num(hb.get("temperature")),
+               _num(hb.get("target")), _num(zt.get("temperature")), pc("fan"), pc("aux_fan"), pc("box_fan")]
+        with self.data_lock:
+            self.samples.append(smp)
+
+    def _poke_status(self):
+        """Refresh the status shortly after a command so the tab shows what the printer really did."""
+        def run():
+            for d in (0.7, 2.2):
+                time.sleep(d)
+                try:
+                    self.request(1002, {}, timeout=10)
+                    self._record_sample()
+                except Exception:
+                    return
+        threading.Thread(target=run, daemon=True, name="cc2-poke").start()
+
+    def _request(self, method, params=None, timeout=20):
         self.ensure_login()
         with self.lock:
             self.seq += 1
@@ -1382,6 +1504,7 @@ class Hub:
             while not ev.is_set():
                 try:
                     self.request(1002, {}, timeout=15)
+                    self._record_sample()
                     fails = 0
                 except Exception as e:
                     self.log("poll: %s" % e)
@@ -1437,7 +1560,14 @@ def _remote_name(p):
 def _send_to_printer(p, update_fn, cancel_fn):
     name = _remote_name(p)
     cb = lambda pct: update_fn and update_fn(ST_UPLOAD, pct, "Uploading to Elegoo cloud")
-    url, md5hex = upload_gcode(_plate_gcode(p), name, cb, cancel_fn)
+    t_up = time.time()
+    try:
+        gdata = _plate_gcode(p)
+        url, md5hex = upload_gcode(gdata, name, cb, cancel_fn)
+        HUB._log_entry("Upload to cloud", "%s (%.1f MB)" % (name, len(gdata) / 1048576.0), True, "", (time.time() - t_up) * 1000)
+    except Exception as e:
+        HUB._log_entry("Upload to cloud", name, False, str(e), (time.time() - t_up) * 1000)
+        raise
     task = uuid.uuid4().hex
     update_fn and update_fn(ST_SEND, 0, "Printer is downloading the file")
     try:
@@ -1508,6 +1638,7 @@ def _in_plugin_thread(fn):
     box = {}
 
     def run():
+        HUB.tl.src = "orca"
         try:
             box["r"] = fn()
         except BaseException as e:  # noqa
@@ -1547,7 +1678,7 @@ class CC2Agent(pa.PrinterAgentBase):
 
     def get_agent_info(self):
         i = pa.AgentInfo()
-        i.id, i.name, i.version = AGENT_ID, "Elegoo CC2 (cloud)", "0.3.2"
+        i.id, i.name, i.version = AGENT_ID, "Elegoo CC2 (cloud)", "0.4.0"
         i.description = "Elegoo Centauri Carbon 2 via the Elegoo cloud"
         return i
 
@@ -1655,6 +1786,7 @@ class CC2Agent(pa.PrinterAgentBase):
 
     def _rc(self, method, params=None):
         def run():
+            HUB.tl.src = "orca"
             try:
                 HUB._exec_ui(method, params or {})
             except Exception as e:
@@ -1828,7 +1960,9 @@ PAGE_HTML = r"""<!doctype html><meta charset="utf-8">
  .chip.bad{border-color:var(--bad);color:var(--bad)} .chip.bad::before{background:var(--bad);opacity:1}
  .chip.warn{border-color:var(--warn);color:var(--warn)} .chip.warn::before{background:var(--warn);opacity:1}
  .themebar{display:flex;gap:6px;align-items:center;font:12px var(--mono);color:var(--dim)}
- .cols{display:grid;gap:16px;grid-template-columns:repeat(auto-fit,minmax(min(100%,480px),1fr));align-items:stretch;transition:opacity .2s}
+ .cols{display:grid;gap:16px;grid-template-columns:1fr;align-items:stretch;transition:opacity .2s}
+ @media (min-width:900px){.cols{grid-template-columns:repeat(2,minmax(0,1fr))}}
+ @media (min-width:1900px){.cols{grid-template-columns:repeat(4,minmax(0,1fr))}}
  .card{display:flex;flex-direction:column;background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:16px 18px;box-shadow:var(--shadow);backdrop-filter:var(--bf);-webkit-backdrop-filter:var(--bf)}
  .card>h3{display:flex;align-items:center;gap:0;margin-bottom:14px;min-height:28px}
  .card>h3>*:first-child{margin-left:auto}
@@ -1874,6 +2008,19 @@ PAGE_HTML = r"""<!doctype html><meta charset="utf-8">
  #camBar{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
  #camMsg{min-height:18px;margin-top:10px;text-align:center}
  footer{margin-top:26px;padding-top:14px;border-top:1px solid var(--line);font:12px var(--mono);color:var(--dim);display:flex;gap:14px;flex-wrap:wrap;justify-content:space-between}
+
+ .rangeb{display:inline-flex;gap:6px;align-items:center}
+ .graphs{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,460px),1fr));gap:18px}
+ .gbox{position:relative} .gbox canvas{width:100%;height:180px;display:block}
+ .legend{display:flex;gap:14px;flex-wrap:wrap;font:12px var(--mono);margin-bottom:6px}
+ .legend i{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:5px;vertical-align:-1px}
+ .tip{position:absolute;top:6px;pointer-events:none;display:none;padding:6px 9px;border-radius:8px;background:var(--panel);border:1px solid var(--line);font:11px/1.5 var(--mono);white-space:nowrap;z-index:3;box-shadow:var(--shadow)}
+ .console{max-height:300px;overflow:auto;background:var(--panel2);border-radius:10px;padding:8px 12px;font:12px/1.7 var(--mono)}
+ .cl{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap}
+ .cl .ct,.cl .cd{color:var(--dim)} .cl .cs{font-size:10px;border:1px solid var(--line);border-radius:6px;padding:0 6px;color:var(--dim)}
+ .cl .cr{margin-left:auto;color:var(--ok)} .cl.bad .cr{color:var(--bad)}
+ .pager{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-top:14px}
+ #app button.pg{min-width:32px;padding:3px 9px}
 
  /* Orca injects <style id="orca-plugin-defaults"> after this one (html/body colours, headings, button, input/select,
     th/td). Equal-specificity rules would lose to it, so the base elements are restated with higher specificity. */
@@ -1950,10 +2097,12 @@ PAGE_HTML = r"""<!doctype html><meta charset="utf-8">
   </div>
 
   <div class="card">
-    <h3>Temperature</h3>
+    <h3>Temperature <span class="rangeb"><button data-r="300000">5 min</button><button data-r="1800000" class="sel">30 min</button><button data-r="7200000">2 h</button><button class="gclear" title="Forget the recorded points">Clear</button></span></h3>
     <div class="row"><span style="width:70px">Nozzle</span><b id="tNz">-</b><span class="mut">/</span><input type="number" id="iNz" min="0" max="350" placeholder="0"><button id="bNz">Set</button><button id="bNz0">Off</button></div>
     <div class="row"><span style="width:70px">Bed</span><b id="tBd">-</b><span class="mut">/</span><input type="number" id="iBd" min="0" max="120" placeholder="0"><button id="bBd">Set</button><button id="bBd0">Off</button></div>
     <div class="row"><span style="width:70px">Chamber</span><b id="tCh">-</b></div>
+    <div class="legend" id="lgT" style="margin-top:10px"></div><div class="gbox"><canvas id="cT"></canvas><div class="tip" id="tipT"></div></div>
+    <div class="mut" style="margin-top:6px;font-size:12px">Recorded while the printer is connected; kept while Orca is running.</div>
   </div>
 
   <div class="card">
@@ -1973,11 +2122,17 @@ PAGE_HTML = r"""<!doctype html><meta charset="utf-8">
   </div>
 
   <div class="card">
-    <h3>Fans and light</h3>
+    <h3>Fans and light <span class="rangeb"><button data-r="300000">5 min</button><button data-r="1800000" class="sel">30 min</button><button data-r="7200000">2 h</button><button class="gclear" title="Forget the recorded points">Clear</button></span></h3>
     <div class="rng"><span>Model</span><input type="range" id="fModel" min="0" max="100" step="5"><b id="vModel">0%</b></div>
     <div class="rng"><span>Assistance</span><input type="range" id="fAux" min="0" max="100" step="5"><b id="vAux">0%</b></div>
     <div class="rng"><span>Case</span><input type="range" id="fCase" min="0" max="100" step="5"><b id="vCase">0%</b></div>
     <div class="row"><label class="sw"><input type="checkbox" id="light"> Overhead light</label></div>
+    <div class="legend" id="lgF" style="margin-top:10px"></div><div class="gbox"><canvas id="cF"></canvas><div class="tip" id="tipF"></div></div>
+  </div>
+
+  <div class="card" style="grid-column:1/-1">
+    <h3>Command console <span><button id="bConClear">Clear</button></span></h3>
+    <div class="console" id="console"><span class="mut">Every command sent to the printer shows up here: motion, temperatures, fans, light, speed, filament, files and prints.</span></div>
   </div>
 
   <div class="card" style="grid-column:1/-1">
@@ -2085,8 +2240,14 @@ function applyStatus(m){
   if(document.activeElement!==$('iNz')) $('iNz').placeholder=Math.round(m.nozzle_t||0); if(document.activeElement!==$('iBd')) $('iBd').placeholder=Math.round(m.bed_t||0);
   $('pos').textContent='X '+(+m.x).toFixed(1)+'  Y '+(+m.y).toFixed(1)+'  Z '+(+m.z).toFixed(1);
   $('homedNote').textContent=m.homed?('Homed axes: '+m.homed.toUpperCase()):'Not homed: home the axes before moving.';
-  for(const [id,k,lab] of [['fModel','model','vModel'],['fAux','aux','vAux'],['fCase','case','vCase']]){ if(dragging!==id){ $(id).value=m[k+'_fan']; } $(lab).textContent=Math.round($(id).value)+'%'; }
-  if(dragging!=='light') $('light').checked=!!m.light; if(document.activeElement!==$('sSpeed')) $('sSpeed').value=String(m.speed);
+  for(const [id,k,lab] of [['fModel','model','vModel'],['fAux','aux','vAux'],['fCase','case','vCase']]){
+    const rep=m[k+'_fan'], hd=HOLD[id], now=Date.now(), pending=!!hd&&now<hd.until&&rep!==hd.v;
+    if(hd&&(rep===hd.v||now>=hd.until)) delete HOLD[id];
+    if(dragging!==id) $(id).value=pending?hd.v:rep;
+    $(lab).textContent=Math.round($(id).value)+'%'+(pending?'\u2026':''); $(lab).title='Reported by the printer: '+rep+'%';
+  }
+  { const hl=HOLD.light, now=Date.now(), rep=!!m.light, pend=!!hl&&now<hl.until&&rep!==!!hl.v; if(hl&&(rep===!!hl.v||now>=hl.until)) delete HOLD.light; if(dragging!=='light') $('light').checked=pend?!!hl.v:rep; }
+  if(document.activeElement!==$('sSpeed')) $('sSpeed').value=String(m.speed);
   const canPause=printing&&!paused, canResume=paused;
   $('bPause').disabled=!canPause; $('bResume').disabled=!canResume; $('bStop').disabled=!(printing||paused);
   document.querySelectorAll('[data-mv],#bHxy,#bHz,#bHall').forEach(b=>b.disabled=!idle);
@@ -2111,6 +2272,8 @@ async function handle(m){
   else if(m.type==='logs') (m.lines||[]).forEach(L);
   else if(m.type==='info'){ $('pname').textContent=m.name||'Elegoo CC2'; $('pinfo').textContent=[m.model,'firmware '+(m.fw||'?'),'LAN IP '+(m.ip||'?'),'SN '+(m.sn||'?')].join('  |  '); }
   else if(m.type==='note'){ note(m.text,m.kind); }
+  else if(m.type==='samples'){ for(const s of (m.items||[])) SAMPLES.push(s); if(SAMPLES.length>1800) SAMPLES.splice(0,SAMPLES.length-1800); scheduleDraw(); }
+  else if(m.type==='cmdlog'){ (m.items||[]).forEach(addCmd); }
   else if(m.type==='prefs'){ PREFS={theme:m.theme||'simple-dark',cam:m.cam!==false}; applyTheme(); }
   else if(m.type==='connstat'){ const e=$('aStat'); e.textContent=m.text; e.style.color=m.kind==='bad'?'var(--bad)':(m.kind==='ok'?'var(--ok)':''); }
   else if(m.type==='account'){ renderAccount(m); }
@@ -2125,7 +2288,7 @@ setInterval(()=>P({type:'pull'}),300);
 /* ---------- controls ---------- */
 /* ---------- theme, links ---------- */
 let PREFS={theme:'simple-dark',cam:true};
-function applyTheme(){ const t=['simple-dark','simple-light','0x'].includes(PREFS.theme)?PREFS.theme:'simple-dark'; document.documentElement.dataset.theme=t; $('thTheme').value=t; $('camAuto').checked=PREFS.cam!==false; }
+function applyTheme(){ const t=['simple-dark','simple-light','0x'].includes(PREFS.theme)?PREFS.theme:'simple-dark'; document.documentElement.dataset.theme=t; $('thTheme').value=t; $('camAuto').checked=PREFS.cam!==false; try{ scheduleDraw(); }catch(e){} }
 $('thTheme').onchange=()=>{ PREFS.theme=$('thTheme').value; applyTheme(); call('prefs_set',PREFS).catch(()=>{}); };
 $('camAuto').onchange=()=>{ PREFS.cam=$('camAuto').checked; call('prefs_set',PREFS).catch(()=>{}); };
 applyTheme();
@@ -2164,12 +2327,14 @@ document.querySelectorAll('[data-mv]').forEach(b=>b.onclick=()=>{ const [ax,sg]=
 $('bHxy').onclick=()=>locked(()=>run('Homing XY',1026,{homed_axes:'xy'},150000)).catch(()=>{});
 $('bHz').onclick=()=>locked(()=>run('Homing Z',1026,{homed_axes:'z'},150000)).catch(()=>{});
 $('bHall').onclick=()=>locked(()=>run('Homing all axes',1026,{homed_axes:'xyz'},180000)).catch(()=>{});
+const HOLD={};   // control id -> {v, until}: the value we just set, shown until the printer reports it (or 8 s pass)
+function holdSet(id,v){ HOLD[id]={v,until:Date.now()+8000}; }
 for(const [id,key,lab] of [['fModel','fan','vModel'],['fAux','aux_fan','vAux'],['fCase','box_fan','vCase']]){
   const el=$(id);
   el.oninput=()=>{ dragging=id; $(lab).textContent=el.value+'%'; };
-  el.onchange=()=>{ run(null,1030,{[key]:Math.round(el.value*255/100)}).catch(()=>{}).finally(()=>{dragging=null;}); };
+  el.onchange=()=>{ const pct=+el.value; holdSet(id,pct); run(null,1030,{[key]:Math.round(pct*255/100)}).catch(()=>{ delete HOLD[id]; }).finally(()=>{dragging=null;}); };
 }
-$('light').onchange=e=>{ dragging='light'; run('Light '+(e.target.checked?'on':'off'),1029,{power:e.target.checked?1:0}).catch(()=>{}).finally(()=>{dragging=null;}); };
+$('light').onchange=e=>{ const on=!!e.target.checked; dragging='light'; holdSet('light',on?1:0); run('Light '+(on?'on':'off'),1029,{power:on?1:0}).catch(()=>{ delete HOLD.light; }).finally(()=>{dragging=null;}); };
 
 /* ---------- camera (Agora RTC, same flow as ElegooSlicer: live/vp8, channel = printer serial) ---------- */
 let CAM=null, CAMON=false, PLAYING=false, SUBS=new Set(), CAMERR='';
@@ -2236,8 +2401,8 @@ $('autoRefill').onchange=e=>run('Auto refill '+(e.target.checked?'on':'off'),200
 
 /* ---------- files and history ---------- */
 let TAB='files', FILES=[];
-$('tFiles').onclick=()=>{ TAB='files'; $('tFiles').classList.add('sel'); $('tHist').classList.remove('sel'); refresh(); };
-$('tHist').onclick=()=>{ TAB='hist'; $('tHist').classList.add('sel'); $('tFiles').classList.remove('sel'); refresh(); };
+$('tFiles').onclick=()=>{ TAB='files'; FP.page=1; $('tFiles').classList.add('sel'); $('tHist').classList.remove('sel'); refresh(); };
+$('tHist').onclick=()=>{ TAB='hist'; HP.page=1; $('tHist').classList.add('sel'); $('tFiles').classList.remove('sel'); refresh(); };
 $('bFiles').onclick=()=>refresh();
 async function refresh(silent){ if(!silent) $('startPanel').style.display='none'; if(TAB==='files') return loadFiles(silent); return loadHistory(silent); }
 setInterval(()=>{ if(S&&S.code!=null&&!document.hidden){ if(S.code===1) loadCanvas(true); refresh(true); } },60000);
@@ -2246,18 +2411,31 @@ async function loadFiles(silent){
   try{ const r=await call('files',{},120000); FILES=r.files||[]; if(TAB==='files') renderFiles(); }
   catch(e){ if(!silent||!FILES.length) $('fileBox').innerHTML='<span class="mut">Could not load files: '+esc(e.message)+'</span>'; }
 }
+let SORTED=[], FP={page:1,size:10}, HP={page:1,size:10,total:0};
+function pager(id,total,page,size){
+  const pages=Math.max(1,Math.ceil(total/size)); page=Math.min(Math.max(1,page),pages);
+  const from=total?(page-1)*size+1:0, to=Math.min(total,page*size);
+  const lo=Math.max(1,Math.min(page-2,pages-4)), hi=Math.min(pages,lo+4), nums=[]; for(let i=lo;i<=hi;i++) nums.push(i);
+  const b=(p,label,dis,cls)=>'<button class="pg'+(cls?' '+cls:'')+'" data-pg="'+id+':'+p+'"'+(dis?' disabled':'')+'>'+label+'</button>';
+  return '<div class="pager">'+b(1,'&laquo;',page===1)+b(page-1,'&lsaquo;',page===1)+nums.map(n=>b(n,n,false,n===page?'sel':'')).join('')+b(page+1,'&rsaquo;',page===pages)+b(pages,'&raquo;',page===pages)+
+    '<span class="mut">'+from+'-'+to+' of '+total+'</span><select data-ps="'+id+'">'+[10,25,50].map(n=>'<option'+(n===size?' selected':'')+'>'+n+'</option>').join('')+'</select><span class="mut">per page</span></div>';
+}
 function renderFiles(){
   if(!FILES.length){ $('fileBox').innerHTML='<span class="mut">No files on the printer.</span>'; return; }
-  const rows=FILES.slice().sort((a,b)=>(b.create_time||0)-(a.create_time||0)).map((f,i)=>{
-    const dots=(f.color_map||[]).map(c=>'<i style="background:'+col(c.color)+'" title="T'+esc(c.t)+' '+esc(c.name)+'"></i>').join('');
+  SORTED=FILES.slice().sort((a,b)=>(b.create_time||0)-(a.create_time||0));
+  const pages=Math.max(1,Math.ceil(SORTED.length/FP.size)); FP.page=Math.min(Math.max(1,FP.page),pages);
+  const off=(FP.page-1)*FP.size;
+  const rows=SORTED.slice(off,off+FP.size).map((f,j)=>{
+    const i=off+j, dots=(f.color_map||[]).map(c=>'<i style="background:'+col(c.color)+'" title="T'+esc(c.t)+' '+esc(c.name)+'"></i>').join('');
     return '<tr><td class="n" title="'+esc(f.filename)+'">'+esc(f.filename)+'</td><td>'+fmtMB(f.size)+'</td><td>'+esc(f.layer||'-')+'</td><td>'+fmtS(f.print_time)+'</td><td>'+(Number(f.total_filament_used)?Number(f.total_filament_used).toFixed(1)+' g':'-')+'</td><td class="dots">'+dots+'</td><td>'+fmtD(f.create_time)+'</td>'+
       '<td style="white-space:nowrap"><button class="pri" data-p="'+i+'">Print</button> <button class="dng" data-d="'+i+'">Delete</button></td></tr>';
   }).join('');
-  $('fileBox').innerHTML='<table><tr><th>File</th><th>Size</th><th>Layers</th><th>Time</th><th>Filament</th><th>Colours</th><th>Created</th><th></th></tr>'+rows+'</table>';
-  const sorted=FILES.slice().sort((a,b)=>(b.create_time||0)-(a.create_time||0));
-  $('fileBox').querySelectorAll('[data-p]').forEach(b=>b.onclick=()=>openStart(sorted[+b.dataset.p]));
-  $('fileBox').querySelectorAll('[data-d]').forEach(b=>b.onclick=()=>askDelete(sorted[+b.dataset.d]));
+  $('fileBox').innerHTML='<table><tr><th>File</th><th>Size</th><th>Layers</th><th>Time</th><th>Filament</th><th>Colours</th><th>Created</th><th></th></tr>'+rows+'</table>'+pager('f',SORTED.length,FP.page,FP.size);
+  $('fileBox').querySelectorAll('[data-p]').forEach(b=>b.onclick=()=>openStart(SORTED[+b.dataset.p]));
+  $('fileBox').querySelectorAll('[data-d]').forEach(b=>b.onclick=()=>askDelete(SORTED[+b.dataset.d]));
 }
+$('fileBox').addEventListener('click',e=>{ const b=e.target.closest&&e.target.closest('[data-pg]'); if(!b||b.disabled) return; const [id,pg]=b.dataset.pg.split(':'); if(id==='f'){ FP.page=+pg; renderFiles(); } else { HP.page=+pg; loadHistory(); } });
+$('fileBox').addEventListener('change',e=>{ const sel=e.target.closest&&e.target.closest('[data-ps]'); if(!sel) return; if(sel.dataset.ps==='f'){ FP.size=+sel.value; FP.page=1; renderFiles(); } else { HP.size=+sel.value; HP.page=1; loadHistory(); } });
 function askDelete(f){
   PANEL++; const p=$('startPanel'); p.style.display='block';
   p.innerHTML='Delete <b>'+esc(f.filename)+'</b> from the printer? <button class="dng" id="yDel">Yes, delete</button> <button id="nDel">No</button>';
@@ -2291,12 +2469,13 @@ async function openStart(f){
 async function loadHistory(silent){
   if(!silent) $('fileBox').innerHTML='<span class="mut">Loading...</span>';
   try{
-    const r=await call('history',{},60000); const list=r.tasks||[];
+    const r=await call('history',{page:HP.page,size:HP.size},60000); const list=r.tasks||[]; HP.total=+r.total||list.length;
     if(TAB!=='hist') return;
+    if(!list.length&&HP.page>1){ HP.page=Math.max(1,Math.ceil(HP.total/HP.size)); return loadHistory(true); }
     if(!list.length){ $('fileBox').innerHTML='<span class="mut">No print history.</span>'; return; }
     const dur=(b,e)=>{ b=+b; e=+e; if(!b||!e||e<b) return '-'; return fmtS(b>1e12?(e-b)/1000:(e-b)); };
     const rows=list.map((h,i)=>'<tr><td class="n" title="'+esc(h.name)+'">'+esc(h.name||'-')+'</td><td>'+fmtD(h.begin)+'</td><td>'+fmtD(h.end)+'</td><td>'+dur(h.begin,h.end)+'</td><td><span class="chip" title="Raw status code reported by the printer">'+esc(h.status==null?'-':'status '+h.status)+'</span></td><td><button class="dng" data-hd="'+i+'">Delete</button></td></tr>').join('');
-    $('fileBox').innerHTML='<table><tr><th>Task</th><th>Started</th><th>Ended</th><th>Duration</th><th>Result</th><th></th></tr>'+rows+'</table>'+(r.total>list.length?'<div class="mut" style="margin-top:8px">Showing the latest '+list.length+' of '+esc(r.total)+'.</div>':'');
+    $('fileBox').innerHTML='<table><tr><th>Task</th><th>Started</th><th>Ended</th><th>Duration</th><th>Result</th><th></th></tr>'+rows+'</table>'+pager('h',HP.total,HP.page,HP.size);
     $('fileBox').querySelectorAll('[data-hd]').forEach(b=>b.onclick=()=>askHistDelete(list[+b.dataset.hd]));
   }catch(e){ if(!silent) $('fileBox').innerHTML='<span class="mut">Could not load history: '+esc(e.message)+'</span>'; }
 }
@@ -2306,6 +2485,56 @@ function askHistDelete(h){
   $('nHd').onclick=()=>{p.style.display='none';};
   $('yHd').onclick=async()=>{ p.style.display='none'; try{ await run('Deleted','history_delete',{ids:[h.id]}); loadHistory(); }catch(e){} };
 }
+
+/* ---------- recorded graphs (canvas, no library) ---------- */
+let SAMPLES=[], RANGE=1800000, DRAWN=0; const HOV={};
+const cssv=n=>getComputedStyle(document.documentElement).getPropertyValue(n).trim()||'#888';
+const TSER=[{k:'Nozzle',i:1,c:'#ff7a45'},{k:'Nozzle target',i:2,c:'#ff7a45',dash:[5,4],w:1.2},{k:'Bed',i:3,c:'#4f8cff'},{k:'Bed target',i:4,c:'#4f8cff',dash:[5,4],w:1.2},{k:'Chamber',i:5,c:'#35c2a1'}];
+const FSER=[{k:'Model',i:6,c:'#ff7a45'},{k:'Assistance',i:7,c:'#4f8cff'},{k:'Case',i:8,c:'#35c2a1'}];
+const niceMax=v=>{ for(const s of [10,20,25,50,100,150,200,250,300,350,400]) if(v<=s) return s; return Math.ceil(v/50)*50; };
+const clk=t=>{ const d=new Date(t); return String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0'); };
+function drawChart(cv,tip,ser,unit,fixedMax){
+  const dpr=window.devicePixelRatio||1, w=cv.clientWidth||600, h=cv.clientHeight||230;
+  if(cv.width!==Math.round(w*dpr)||cv.height!==Math.round(h*dpr)){ cv.width=Math.round(w*dpr); cv.height=Math.round(h*dpr); }
+  const c=cv.getContext('2d'); c.setTransform(dpr,0,0,dpr,0,0); c.clearRect(0,0,w,h);
+  const L=44,R=10,T=10,B=22, pw=w-L-R, ph=h-T-B, now=Date.now(), t0=now-RANGE;
+  const pts=SAMPLES.filter(s=>s[0]>=t0);
+  const ymax=fixedMax||niceMax(Math.max(10,...pts.flatMap(s=>ser.map(d=>s[d.i]))));
+  const X=t=>L+(t-t0)/RANGE*pw, Y=v=>T+ph-(Math.min(Math.max(v,0),ymax)/ymax)*ph;
+  c.font='11px '+(cssv('--mono')||'monospace'); c.lineWidth=1; c.strokeStyle=cssv('--line'); c.fillStyle=cssv('--dim');
+  for(let k=0;k<=4;k++){ const v=ymax*k/4, y=Y(v); c.beginPath(); c.moveTo(L,y); c.lineTo(w-R,y); c.stroke(); c.fillText(Math.round(v)+unit,4,y+4); }
+  const step=RANGE<=300000?60000:RANGE<=1800000?300000:900000;
+  for(let t=Math.ceil(t0/step)*step;t<=now;t+=step){ const x=X(t); c.beginPath(); c.moveTo(x,T); c.lineTo(x,T+ph); c.stroke(); c.fillText(clk(t),x-14,h-6); }
+  for(const d of ser){ c.beginPath(); c.strokeStyle=d.c; c.lineWidth=d.w||1.9; c.setLineDash(d.dash||[]); let first=true;
+    for(const s of pts){ const x=X(s[0]), y=Y(s[d.i]); if(first){ c.moveTo(x,y); first=false; } else c.lineTo(x,y); } c.stroke(); }
+  c.setLineDash([]);
+  if(!pts.length){ c.fillStyle=cssv('--dim'); c.fillText('Waiting for data from the printer...',L+10,T+34); }
+  const hx=HOV[cv.id];
+  if(hx!=null&&pts.length){
+    const tt=t0+(hx-L)/pw*RANGE; let best=pts[0]; for(const s of pts) if(Math.abs(s[0]-tt)<Math.abs(best[0]-tt)) best=s;
+    const x=X(best[0]); c.strokeStyle=cssv('--dim'); c.beginPath(); c.moveTo(x,T); c.lineTo(x,T+ph); c.stroke();
+    tip.style.display='block'; tip.innerHTML='<b>'+clk(best[0])+':'+String(new Date(best[0]).getSeconds()).padStart(2,'0')+'</b><br>'+ser.map(d=>'<i style="display:inline-block;width:8px;height:8px;border-radius:50%;background:'+d.c+';margin-right:5px"></i>'+d.k+' '+Math.round(best[d.i])+unit).join('<br>');
+    tip.style.left=Math.max(4,Math.min(w-tip.offsetWidth-4,x+12))+'px';
+  } else tip.style.display='none';
+}
+function legend(el,ser,unit){ const l=SAMPLES.length?SAMPLES[SAMPLES.length-1]:null; el.innerHTML=ser.filter(d=>!d.dash).map(d=>'<span><i style="background:'+d.c+'"></i>'+d.k+(l?' <b>'+Math.round(l[d.i])+unit+'</b>':'')+'</span>').join(''); }
+function drawAll(){ DRAWN=0; try{ drawChart($('cT'),$('tipT'),TSER,'°',0); drawChart($('cF'),$('tipF'),FSER,'%',100); legend($('lgT'),TSER,'°'); legend($('lgF'),FSER,'%'); }catch(e){} }
+function scheduleDraw(){ if(DRAWN) return; DRAWN=requestAnimationFrame(drawAll); }
+for(const id of ['cT','cF']){ const cv=$(id); cv.onmousemove=e=>{ HOV[id]=e.clientX-cv.getBoundingClientRect().left; scheduleDraw(); }; cv.onmouseleave=()=>{ HOV[id]=null; scheduleDraw(); }; }
+document.querySelectorAll('.rangeb [data-r]').forEach(b=>b.onclick=()=>{ RANGE=+b.dataset.r; document.querySelectorAll('.rangeb [data-r]').forEach(x=>x.classList.toggle('sel',+x.dataset.r===RANGE)); scheduleDraw(); });
+document.querySelectorAll('.gclear').forEach(b=>b.onclick=()=>{ SAMPLES=[]; call('samples_clear').catch(()=>{}); scheduleDraw(); });
+window.addEventListener('resize',scheduleDraw); setInterval(scheduleDraw,15000); scheduleDraw();
+
+/* ---------- command console ---------- */
+const CON=$('console'); let CONN=0;
+const clock=t=>new Date(t).toTimeString().slice(0,8);
+function addCmd(e){
+  if(!CONN) CON.innerHTML=''; CONN++; const near=CON.scrollTop+CON.clientHeight>=CON.scrollHeight-30;
+  const d=document.createElement('div'); d.className='cl'+(e.ok?'':' bad');
+  d.innerHTML='<span class="ct">'+clock(e.t)+'</span><span class="cs">'+esc(e.src)+'</span><b>'+esc(e.label)+'</b><span class="cd">'+esc(e.detail||'')+'</span><span class="cr">'+(e.ok?'ok':'failed: '+esc(e.err))+' &middot; '+((e.ms||0)/1000).toFixed(1)+' s</span>';
+  CON.appendChild(d); while(CON.children.length>400) CON.removeChild(CON.firstChild); if(near) CON.scrollTop=CON.scrollHeight;
+}
+$('bConClear').onclick=()=>{ CON.innerHTML='<span class="mut">Cleared.</span>'; CONN=0; call('cmdlog_clear').catch(()=>{}); };
 
 if(typeof AgoraRTM==='undefined'){ setChip('cRtm','RTM: SDK not loaded','bad'); L('AgoraRTM script failed to load'); }
 P({type:'ready'});
