@@ -2026,10 +2026,9 @@ class CC2Agent(pa.PrinterAgentBase):
         return 0
 
     def disconnect_printer(self):
-        HUB.want_poll = False
-        HUB.stop_poll()
-        HUB.was_connected = False
-        HUB.logout()
+        # Orca calls this when it switches machines or finishes a job. The cloud link belongs to the Elegoo CC2 tab
+        # (Connect / Log out there), so keep it alive instead of tearing it down.
+        HUB.log("Orca asked to disconnect the printer (ignored; the tab keeps the cloud link)")
         return 0
 
     # ---- messaging (translate Bambu-style JSON used by default command_* implementations)
