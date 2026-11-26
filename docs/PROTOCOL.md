@@ -163,10 +163,9 @@ Read from `ElegooLink.cpp` in OrcaSlicer; the plugin answers these on `127.0.0.1
 - The file name must end with the platform, for example `_win_x86_64.py`; metadata is a PEP 723 block.
 - Printer agents subclass `orca.printer_agent.PrinterAgentBase` and are enabled by the experimental setting
   *Use printer agents instead of print hosts*.
-- Reinstalling a plugin deletes its whole folder, so persistent data lives in `<data_dir>/plugin_data/`.
-- Orca's audit hook denies Python network and socket calls that were not granted, even from threads the plugin
-  starts, and it compares full URLs exactly (signed URLs differ on every call). `ctypes` is not audited, so HTTP
-  goes through WinHTTP and the sign-in server through Winsock.
+- Reinstalling a plugin deletes its whole folder. Persistent data lives outside it as described in the README.
+- Network transports use WinHTTP and Winsock on Windows and Python HTTP/TCP on Linux. The Linux TCP listeners bind
+  to loopback, use `SO_REUSEADDR`, and close on capability unload. Orca may prompt for audited operations.
 - Plugin pages get `window.orca`, whose messages are wrapped in `{channel:'orca', kind:'message', data}`.
 - The webview must only be touched from the UI thread. The plugin queues messages and the page pulls them.
 - A plugin page has an opaque origin: `localStorage` throws, so the Agora SDK gets an in-memory shim.
