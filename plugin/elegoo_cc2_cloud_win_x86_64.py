@@ -1,12 +1,12 @@
 # /// script
 # requires-python = ">=3.12"
-# dependencies = []
+# dependencies = ["cryptography>=42; sys_platform == 'linux'"]
 #
 # [tool.orcaslicer.plugin]
 # name = "Elegoo CC2 Cloud"
-# description = "Send gcode to and control an Elegoo Centauri Carbon 2 from OrcaSlicer through the Elegoo cloud: upload, start/pause/stop, live status. Reuses your ElegooSlicer login (close ElegooSlicer while connected)."
+# description = "Send gcode to and control an Elegoo Centauri Carbon 2 from OrcaSlicer through the Elegoo cloud: upload, start/pause/stop, live status. Uses Elegoo browser sign-in, with optional ElegooSlicer session import on Windows."
 # author = "0xpraet0rian"
-# version = "0.5.0"
+# version = "0.6.0"
 # ///
 """
 Elegoo Centauri Carbon 2 - cloud printer agent for OrcaSlicer 2.5.x
@@ -18,26 +18,25 @@ Architecture
   * Python  : agent (discovery, connect, status mapping, upload, print), HTTP to matrix.elegoo.com
   * JS page : the "Elegoo CC2" tab loads Agora Web RTM and is only a transport
               (commands are published over RTM; the cloud has no other command path)
-  * Auth    : reuses the ElegooSlicer login (DPAPI blob %APPDATA%\\ElegooSlicer\\user\\user_info).
-              The token is never refreshed here (that would sign ElegooSlicer out).
-
-Limits of v0.1
-  * Open the "Elegoo CC2" tab once per Orca session so the RTM page exists.
-  * Close ElegooSlicer while this plugin is connected (one cloud session per account).
-  * No camera. Status-state mapping is a first guess and needs calibration on real prints.
+  * Auth    : Elegoo browser sign-in and an encrypted local session.
 """
 import base64
 import collections
-import ctypes
-import ctypes.wintypes as wt
 import hashlib
+import hmac
+import http.client
 import io
 import json
 import os
+from pathlib import Path
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
 import threading
 import time
 import urllib.parse
-import urllib.request
 import uuid
 import zipfile
 
@@ -48,13 +47,22 @@ pa = orca.printer_agent
 BASE = "https://matrix.elegoo.com"
 AGENT_ID = "elegoo_cc2_cloud"
 AGORA_APP_ID = "d035320941e34cd5bc4ec106eff05580"  # public id from elegoo-link rtm_service.cpp
-USER_INFO = os.path.expandvars(r"%APPDATA%\ElegooSlicer\user\user_info")
-_HERE = os.path.dirname(os.path.abspath(__file__))
-# Orca deletes the whole plugin folder on reinstall, so keep the session and preferences next to it, in the
-# application data dir (<data_dir>/plugin_data/...). CC2_DATA_DIR overrides this for tests.
-_DATA = os.environ.get("CC2_DATA_DIR") or os.path.join(os.path.dirname(os.path.dirname(_HERE)), "plugin_data", "elegoo_cc2_cloud")
-SESSION_FILE = os.path.join(_DATA, "cc2_session.dat")   # DPAPI-encrypted
-LOGIN_URL = "https://account.elegoo.com/account/slicer-login?region=%s&theme=%s&deviceId=%s"
+IS_WINDOWS = sys.platform == "win32"
+IS_LINUX = sys.platform.startswith("linux")
+_HERE = Path(__file__).resolve().parent
+if IS_WINDOWS:
+    import ctypes
+    import ctypes.wintypes as wt
+
+    USER_INFO = Path(os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming") / "ElegooSlicer" / "user" / "user_info"
+    _DEFAULT_DATA = _HERE.parent.parent / "plugin_data" / AGENT_ID
+else:
+    _config = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+    if not _config.is_absolute():
+        _config = Path.home() / ".config"
+    _DEFAULT_DATA = _config / "OrcaSlicer" / "plugin_data" / AGENT_ID
+_DATA = Path(os.environ.get("CC2_DATA_DIR") or _DEFAULT_DATA)
+SESSION_FILE = _DATA / "cc2_session.dat"
 UA = "Mozilla/5.0"
 
 # update_fn stage numbers (Bambu-style guess: 1 upload, 3 sending, 5 wait printer, 6 finished, 7 error)
@@ -62,141 +70,164 @@ ST_UPLOAD, ST_SEND, ST_WAIT, ST_DONE, ST_ERR = 1, 3, 5, 6, 7
 
 
 # --------------------------------------------------------------------------- helpers
-class _Blob(ctypes.Structure):
-    _fields_ = [("n", wt.DWORD), ("p", ctypes.POINTER(ctypes.c_char))]
+if IS_WINDOWS:
+    class _Blob(ctypes.Structure):
+        _fields_ = [("n", wt.DWORD), ("p", ctypes.POINTER(ctypes.c_char))]
 
 
-def _dpapi(data: bytes) -> bytes:
-    i = _Blob(len(data), ctypes.cast(ctypes.create_string_buffer(data, len(data)), ctypes.POINTER(ctypes.c_char)))
-    o = _Blob()
-    if not ctypes.windll.crypt32.CryptUnprotectData(ctypes.byref(i), None, None, None, None, 0, ctypes.byref(o)):
-        raise OSError("DPAPI decrypt failed")
-    out = ctypes.string_at(o.p, o.n)
-    ctypes.windll.kernel32.LocalFree(o.p)
-    return out
+    def _dpapi(data: bytes) -> bytes:
+        i = _Blob(len(data), ctypes.cast(ctypes.create_string_buffer(data, len(data)), ctypes.POINTER(ctypes.c_char)))
+        o = _Blob()
+        if not ctypes.windll.crypt32.CryptUnprotectData(ctypes.byref(i), None, None, None, None, 0, ctypes.byref(o)):
+            raise OSError("DPAPI decrypt failed")
+        out = ctypes.string_at(o.p, o.n)
+        ctypes.windll.kernel32.LocalFree(o.p)
+        return out
 
 
-def _protect(data: bytes) -> bytes:
-    i = _Blob(len(data), ctypes.cast(ctypes.create_string_buffer(data, len(data)), ctypes.POINTER(ctypes.c_char)))
-    o = _Blob()
-    if not ctypes.windll.crypt32.CryptProtectData(ctypes.byref(i), "cc2", None, None, None, 0, ctypes.byref(o)):
-        raise OSError("DPAPI encrypt failed")
-    out = ctypes.string_at(o.p, o.n)
-    ctypes.windll.kernel32.LocalFree(o.p)
-    return out
+    def _protect(data: bytes) -> bytes:
+        i = _Blob(len(data), ctypes.cast(ctypes.create_string_buffer(data, len(data)), ctypes.POINTER(ctypes.c_char)))
+        o = _Blob()
+        if not ctypes.windll.crypt32.CryptProtectData(ctypes.byref(i), "cc2", None, None, None, 0, ctypes.byref(o)):
+            raise OSError("DPAPI encrypt failed")
+        out = ctypes.string_at(o.p, o.n)
+        ctypes.windll.kernel32.LocalFree(o.p)
+        return out
 
 
-def _elegoo_user() -> dict:
-    return json.loads(_dpapi(_read_bytes(USER_INFO)).decode("utf-8"))
+    def _elegoo_user() -> dict:
+        return json.loads(_dpapi(_read_bytes(USER_INFO)).decode("utf-8"))
 
 
-_wh = ctypes.WinDLL("winhttp", use_last_error=True)
-_k32 = ctypes.WinDLL("kernel32", use_last_error=True)
-_vp = ctypes.c_void_p
-_wh.WinHttpOpen.restype = _vp
-_wh.WinHttpOpen.argtypes = [wt.LPCWSTR, wt.DWORD, wt.LPCWSTR, wt.LPCWSTR, wt.DWORD]
-_wh.WinHttpConnect.restype = _vp
-_wh.WinHttpConnect.argtypes = [_vp, wt.LPCWSTR, wt.WORD, wt.DWORD]
-_wh.WinHttpOpenRequest.restype = _vp
-_wh.WinHttpOpenRequest.argtypes = [_vp, wt.LPCWSTR, wt.LPCWSTR, wt.LPCWSTR, wt.LPCWSTR, _vp, wt.DWORD]
-_wh.WinHttpSendRequest.argtypes = [_vp, wt.LPCWSTR, wt.DWORD, _vp, wt.DWORD, wt.DWORD, _vp]
-_wh.WinHttpWriteData.argtypes = [_vp, _vp, wt.DWORD, ctypes.POINTER(wt.DWORD)]
-_wh.WinHttpReceiveResponse.argtypes = [_vp, _vp]
-_wh.WinHttpQueryHeaders.argtypes = [_vp, wt.DWORD, wt.LPCWSTR, _vp, ctypes.POINTER(wt.DWORD), _vp]
-_wh.WinHttpReadData.argtypes = [_vp, _vp, wt.DWORD, ctypes.POINTER(wt.DWORD)]
-_wh.WinHttpSetTimeouts.argtypes = [_vp, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
-_wh.WinHttpSetOption.argtypes = [_vp, wt.DWORD, _vp, wt.DWORD]
-_wh.WinHttpCloseHandle.argtypes = [_vp]
-_k32.CreateFileW.restype = _vp
-_k32.CreateFileW.argtypes = [wt.LPCWSTR, wt.DWORD, wt.DWORD, _vp, wt.DWORD, wt.DWORD, _vp]
-_k32.ReadFile.argtypes = [_vp, _vp, wt.DWORD, ctypes.POINTER(wt.DWORD), _vp]
-_k32.GetFileSizeEx.argtypes = [_vp, ctypes.POINTER(ctypes.c_longlong)]
-_k32.CloseHandle.argtypes = [_vp]
+    _wh = ctypes.WinDLL("winhttp", use_last_error=True)
+    _k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _vp = ctypes.c_void_p
+    _wh.WinHttpOpen.restype = _vp
+    _wh.WinHttpOpen.argtypes = [wt.LPCWSTR, wt.DWORD, wt.LPCWSTR, wt.LPCWSTR, wt.DWORD]
+    _wh.WinHttpConnect.restype = _vp
+    _wh.WinHttpConnect.argtypes = [_vp, wt.LPCWSTR, wt.WORD, wt.DWORD]
+    _wh.WinHttpOpenRequest.restype = _vp
+    _wh.WinHttpOpenRequest.argtypes = [_vp, wt.LPCWSTR, wt.LPCWSTR, wt.LPCWSTR, wt.LPCWSTR, _vp, wt.DWORD]
+    _wh.WinHttpSendRequest.argtypes = [_vp, wt.LPCWSTR, wt.DWORD, _vp, wt.DWORD, wt.DWORD, _vp]
+    _wh.WinHttpWriteData.argtypes = [_vp, _vp, wt.DWORD, ctypes.POINTER(wt.DWORD)]
+    _wh.WinHttpReceiveResponse.argtypes = [_vp, _vp]
+    _wh.WinHttpQueryHeaders.argtypes = [_vp, wt.DWORD, wt.LPCWSTR, _vp, ctypes.POINTER(wt.DWORD), _vp]
+    _wh.WinHttpReadData.argtypes = [_vp, _vp, wt.DWORD, ctypes.POINTER(wt.DWORD)]
+    _wh.WinHttpSetTimeouts.argtypes = [_vp, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+    _wh.WinHttpSetOption.argtypes = [_vp, wt.DWORD, _vp, wt.DWORD]
+    _wh.WinHttpCloseHandle.argtypes = [_vp]
+    _k32.CreateFileW.restype = _vp
+    _k32.CreateFileW.argtypes = [wt.LPCWSTR, wt.DWORD, wt.DWORD, _vp, wt.DWORD, wt.DWORD, _vp]
+    _k32.ReadFile.argtypes = [_vp, _vp, wt.DWORD, ctypes.POINTER(wt.DWORD), _vp]
+    _k32.GetFileSizeEx.argtypes = [_vp, ctypes.POINTER(ctypes.c_longlong)]
+    _k32.CloseHandle.argtypes = [_vp]
 
 
-def _read_bytes(path):
-    h = _k32.CreateFileW(path, 0x80000000, 1 | 2, None, 3, 0x80, None)
-    if h in (None, ctypes.c_void_p(-1).value):
-        raise OSError("cannot open %s (error %d)" % (os.path.basename(path), ctypes.get_last_error()))
-    try:
-        size = ctypes.c_longlong()
-        _k32.GetFileSizeEx(h, ctypes.byref(size))
-        buf = (ctypes.c_char * size.value)()
-        got, done = wt.DWORD(), 0
-        while done < size.value:
-            n = min(1 << 24, size.value - done)
-            if not _k32.ReadFile(h, ctypes.byref(buf, done), n, ctypes.byref(got), None) or got.value == 0:
-                raise OSError("read error")
-            done += got.value
-        return bytes(buf)
-    finally:
-        _k32.CloseHandle(h)
+    def _read_bytes(path):
+        h = _k32.CreateFileW(os.fspath(path), 0x80000000, 1 | 2, None, 3, 0x80, None)
+        if h in (None, ctypes.c_void_p(-1).value):
+            raise OSError("cannot open %s (error %d)" % (os.path.basename(path), ctypes.get_last_error()))
+        try:
+            size = ctypes.c_longlong()
+            _k32.GetFileSizeEx(h, ctypes.byref(size))
+            buf = (ctypes.c_char * size.value)()
+            got, done = wt.DWORD(), 0
+            while done < size.value:
+                n = min(1 << 24, size.value - done)
+                if not _k32.ReadFile(h, ctypes.byref(buf, done), n, ctypes.byref(got), None) or got.value == 0:
+                    raise OSError("read error")
+                done += got.value
+            return bytes(buf)
+        finally:
+            _k32.CloseHandle(h)
 
 
-def _http_full(method, url, headers=None, data=None, timeout=30, user_agent=None):
-    """Returns (status, [(header, value)...], body). No redirects, no automatic cookies."""
-    u = urllib.parse.urlsplit(url)
-    secure = u.scheme == "https"
-    port = u.port or (443 if secure else 80)
-    path = (u.path or "/") + (("?" + u.query) if u.query else "")
-    h = {"User-Agent": user_agent or UA}
-    h.update(headers or {})
-    hdr = "".join("%s: %s\r\n" % (k, v) for k, v in h.items())
-    ses = _wh.WinHttpOpen("Mozilla/5.0", 4, None, None, 0) or _wh.WinHttpOpen("Mozilla/5.0", 0, None, None, 0)
-    if not ses:
-        raise OSError("WinHttpOpen failed")
-    con = req = None
-    try:
-        ms = int(timeout * 1000)
-        _wh.WinHttpSetTimeouts(ses, 15000, 15000, ms, ms)
-        con = _wh.WinHttpConnect(ses, u.hostname, port, 0)
-        req = _wh.WinHttpOpenRequest(con, method, path, None, None, None, 0x800000 if secure else 0)
-        if not (con and req):
-            raise OSError("WinHTTP request setup failed (%d)" % ctypes.get_last_error())
-        off = wt.DWORD(0x3)  # WINHTTP_DISABLE_COOKIES | WINHTTP_DISABLE_REDIRECTS (option 63)
-        if not _wh.WinHttpSetOption(req, 63, ctypes.byref(off), 4):
-            raise OSError("cannot disable redirects (%d)" % ctypes.get_last_error())
-        total = len(data) if data else 0
-        if not _wh.WinHttpSendRequest(req, hdr, 0xFFFFFFFF, None, 0, total, None):
-            raise OSError("WinHTTP send failed (%d)" % ctypes.get_last_error())
-        if total:
-            sent, w = 0, wt.DWORD()
-            mv = memoryview(data)
-            while sent < total:
-                chunk = bytes(mv[sent:sent + (1 << 20)])
-                if not _wh.WinHttpWriteData(req, chunk, len(chunk), ctypes.byref(w)):
-                    raise OSError("WinHTTP write failed (%d)" % ctypes.get_last_error())
-                sent += w.value
-        if not _wh.WinHttpReceiveResponse(req, None):
-            raise OSError("WinHTTP receive failed (%d)" % ctypes.get_last_error())
-        code, sz = wt.DWORD(), wt.DWORD(4)
-        _wh.WinHttpQueryHeaders(req, 19 | 0x20000000, None, ctypes.byref(code), ctypes.byref(sz), None)
-        raw = ""
-        sz2 = wt.DWORD(0)
-        _wh.WinHttpQueryHeaders(req, 22, None, None, ctypes.byref(sz2), None)   # size probe (raw CRLF headers)
-        if sz2.value:
-            hb = ctypes.create_unicode_buffer(sz2.value // 2 + 2)
-            if _wh.WinHttpQueryHeaders(req, 22, None, hb, ctypes.byref(sz2), None):
-                raw = hb.value
-        pairs = []
-        for ln in raw.split("\r\n")[1:]:
-            if ":" in ln:
-                k, v = ln.split(":", 1)
-                pairs.append((k.strip(), v.strip()))
-        out = []
-        buf = ctypes.create_string_buffer(65536)
-        while True:
-            rd = wt.DWORD()
-            if not _wh.WinHttpReadData(req, buf, 65536, ctypes.byref(rd)):
-                raise OSError("WinHTTP read failed (%d)" % ctypes.get_last_error())
-            if rd.value == 0:
-                break
-            out.append(buf.raw[:rd.value])
-        return code.value, pairs, b"".join(out)
-    finally:
-        for hnd in (req, con, ses):
-            if hnd:
-                _wh.WinHttpCloseHandle(hnd)
+    def _http_full(method, url, headers=None, data=None, timeout=30, user_agent=None):
+        """Returns (status, [(header, value)...], body). No redirects, no automatic cookies."""
+        u = urllib.parse.urlsplit(url)
+        secure = u.scheme == "https"
+        port = u.port or (443 if secure else 80)
+        path = (u.path or "/") + (("?" + u.query) if u.query else "")
+        h = {"User-Agent": user_agent or UA}
+        h.update(headers or {})
+        hdr = "".join("%s: %s\r\n" % (k, v) for k, v in h.items())
+        ses = _wh.WinHttpOpen("Mozilla/5.0", 4, None, None, 0) or _wh.WinHttpOpen("Mozilla/5.0", 0, None, None, 0)
+        if not ses:
+            raise OSError("WinHttpOpen failed")
+        con = req = None
+        try:
+            ms = int(timeout * 1000)
+            _wh.WinHttpSetTimeouts(ses, 15000, 15000, ms, ms)
+            con = _wh.WinHttpConnect(ses, u.hostname, port, 0)
+            req = _wh.WinHttpOpenRequest(con, method, path, None, None, None, 0x800000 if secure else 0)
+            if not (con and req):
+                raise OSError("WinHTTP request setup failed (%d)" % ctypes.get_last_error())
+            off = wt.DWORD(0x3)  # WINHTTP_DISABLE_COOKIES | WINHTTP_DISABLE_REDIRECTS (option 63)
+            if not _wh.WinHttpSetOption(req, 63, ctypes.byref(off), 4):
+                raise OSError("cannot disable redirects (%d)" % ctypes.get_last_error())
+            total = len(data) if data else 0
+            if not _wh.WinHttpSendRequest(req, hdr, 0xFFFFFFFF, None, 0, total, None):
+                raise OSError("WinHTTP send failed (%d)" % ctypes.get_last_error())
+            if total:
+                sent, w = 0, wt.DWORD()
+                mv = memoryview(data)
+                while sent < total:
+                    chunk = bytes(mv[sent:sent + (1 << 20)])
+                    if not _wh.WinHttpWriteData(req, chunk, len(chunk), ctypes.byref(w)):
+                        raise OSError("WinHTTP write failed (%d)" % ctypes.get_last_error())
+                    sent += w.value
+            if not _wh.WinHttpReceiveResponse(req, None):
+                raise OSError("WinHTTP receive failed (%d)" % ctypes.get_last_error())
+            code, sz = wt.DWORD(), wt.DWORD(4)
+            _wh.WinHttpQueryHeaders(req, 19 | 0x20000000, None, ctypes.byref(code), ctypes.byref(sz), None)
+            raw = ""
+            sz2 = wt.DWORD(0)
+            _wh.WinHttpQueryHeaders(req, 22, None, None, ctypes.byref(sz2), None)   # size probe (raw CRLF headers)
+            if sz2.value:
+                hb = ctypes.create_unicode_buffer(sz2.value // 2 + 2)
+                if _wh.WinHttpQueryHeaders(req, 22, None, hb, ctypes.byref(sz2), None):
+                    raw = hb.value
+            pairs = []
+            for ln in raw.split("\r\n")[1:]:
+                if ":" in ln:
+                    k, v = ln.split(":", 1)
+                    pairs.append((k.strip(), v.strip()))
+            out = []
+            buf = ctypes.create_string_buffer(65536)
+            while True:
+                rd = wt.DWORD()
+                if not _wh.WinHttpReadData(req, buf, 65536, ctypes.byref(rd)):
+                    raise OSError("WinHTTP read failed (%d)" % ctypes.get_last_error())
+                if rd.value == 0:
+                    break
+                out.append(buf.raw[:rd.value])
+            return code.value, pairs, b"".join(out)
+        finally:
+            for hnd in (req, con, ses):
+                if hnd:
+                    _wh.WinHttpCloseHandle(hnd)
+
+
+else:
+    def _read_bytes(path):
+        return Path(path).read_bytes()
+
+    def _http_full(method, url, headers=None, data=None, timeout=30, user_agent=None):
+        """Return status, raw header pairs and body, with no redirect or cookie handling."""
+        parts = urllib.parse.urlsplit(url)
+        connection_type = {"http": http.client.HTTPConnection, "https": http.client.HTTPSConnection}.get(parts.scheme)
+        if connection_type is None or not parts.hostname:
+            raise ValueError("Expected an HTTP(S) URL")
+        target = urllib.parse.urlunsplit(("", "", parts.path or "/", parts.query, ""))
+        request_headers = {"User-Agent": user_agent or UA}
+        request_headers.update(headers or {})
+        connection = connection_type(parts.hostname, parts.port, timeout=timeout)
+        try:
+            connection.request(method, target, body=data, headers=request_headers)
+            with connection.getresponse() as response:
+                return response.status, response.getheaders(), response.read()
+        finally:
+            connection.close()
 
 
 def _http(method, url, headers=None, data=None, timeout=30):
@@ -206,82 +237,150 @@ def _http(method, url, headers=None, data=None, timeout=30):
 
 
 # --------------------------------------------------------------------------- local sign-in pass-through
-# Orca ignores the sign-in page's native-bridge messages, so the official page is served to the user's browser
-# through a tiny loopback server that adds the bridge ("window.wx") the page expects. Built on ctypes (Winsock +
-# WinHTTP) because Orca audits Python sockets/urllib. Request bodies (including the password) are forwarded in
-# memory only: nothing is logged or stored except the session the page reports after a successful login.
-_ws = ctypes.WinDLL("ws2_32", use_last_error=True)
-_SOCK = ctypes.c_size_t
-_INVALID_SOCK = _SOCK(-1).value
+# The browser sign-in page uses a desktop message bridge. Keep the pass-through on loopback.
+if IS_WINDOWS:
+    _ws = ctypes.WinDLL("ws2_32", use_last_error=True)
+    _SOCK = ctypes.c_size_t
+    _INVALID_SOCK = _SOCK(-1).value
 
 
-class _SockAddrIn(ctypes.Structure):
-    _fields_ = [("family", ctypes.c_short), ("port", ctypes.c_ushort),
-                ("addr", ctypes.c_ubyte * 4), ("zero", ctypes.c_ubyte * 8)]
+    class _SockAddrIn(ctypes.Structure):
+        _fields_ = [("family", ctypes.c_short), ("port", ctypes.c_ushort),
+                    ("addr", ctypes.c_ubyte * 4), ("zero", ctypes.c_ubyte * 8)]
 
 
-_ws.socket.restype = _SOCK
-_ws.socket.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int]
-_ws.bind.argtypes = [_SOCK, ctypes.c_void_p, ctypes.c_int]
-_ws.listen.argtypes = [_SOCK, ctypes.c_int]
-_ws.accept.restype = _SOCK
-_ws.accept.argtypes = [_SOCK, ctypes.c_void_p, ctypes.c_void_p]
-_ws.getsockname.argtypes = [_SOCK, ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
-_ws.recv.restype = ctypes.c_int
-_ws.recv.argtypes = [_SOCK, ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
-_ws.send.restype = ctypes.c_int
-_ws.send.argtypes = [_SOCK, ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
-_ws.closesocket.argtypes = [_SOCK]
-_ws.connect.restype = ctypes.c_int
-_ws.connect.argtypes = [_SOCK, ctypes.c_void_p, ctypes.c_int]
-_ws.shutdown.argtypes = [_SOCK, ctypes.c_int]
-_ws.setsockopt.argtypes = [_SOCK, ctypes.c_int, ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
-_WSA_READY = []
+    _ws.socket.restype = _SOCK
+    _ws.socket.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int]
+    _ws.bind.argtypes = [_SOCK, ctypes.c_void_p, ctypes.c_int]
+    _ws.listen.argtypes = [_SOCK, ctypes.c_int]
+    _ws.accept.restype = _SOCK
+    _ws.accept.argtypes = [_SOCK, ctypes.c_void_p, ctypes.c_void_p]
+    _ws.getsockname.argtypes = [_SOCK, ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
+    _ws.recv.restype = ctypes.c_int
+    _ws.recv.argtypes = [_SOCK, ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+    _ws.send.restype = ctypes.c_int
+    _ws.send.argtypes = [_SOCK, ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+    _ws.closesocket.argtypes = [_SOCK]
+    _ws.connect.restype = ctypes.c_int
+    _ws.connect.argtypes = [_SOCK, ctypes.c_void_p, ctypes.c_int]
+    _ws.shutdown.argtypes = [_SOCK, ctypes.c_int]
+    _ws.setsockopt.argtypes = [_SOCK, ctypes.c_int, ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
+    _WSA_READY = []
 
 
-def _wsa():
-    if not _WSA_READY:
-        _ws.WSAStartup(0x0202, ctypes.create_string_buffer(512))
-        _WSA_READY.append(1)
+    def _wsa():
+        if not _WSA_READY:
+            _ws.WSAStartup(0x0202, ctypes.create_string_buffer(512))
+            _WSA_READY.append(1)
 
 
-def _pick_gcode():
-    """Windows 'Open' dialog for a .gcode / .gcode.3mf file; returns the path or ''."""
-    class OFN(ctypes.Structure):
-        _fields_ = [("lStructSize", wt.DWORD), ("hwndOwner", wt.HWND), ("hInstance", wt.HINSTANCE),
-                    ("lpstrFilter", wt.LPCWSTR), ("lpstrCustomFilter", wt.LPWSTR), ("nMaxCustFilter", wt.DWORD),
-                    ("nFilterIndex", wt.DWORD), ("lpstrFile", wt.LPWSTR), ("nMaxFile", wt.DWORD),
-                    ("lpstrFileTitle", wt.LPWSTR), ("nMaxFileTitle", wt.DWORD), ("lpstrInitialDir", wt.LPCWSTR),
-                    ("lpstrTitle", wt.LPCWSTR), ("Flags", wt.DWORD), ("nFileOffset", wt.WORD),
-                    ("nFileExtension", wt.WORD), ("lpstrDefExt", wt.LPCWSTR), ("lCustData", wt.LPARAM),
-                    ("lpfnHook", ctypes.c_void_p), ("lpTemplateName", wt.LPCWSTR), ("pvReserved", ctypes.c_void_p),
-                    ("dwReserved", wt.DWORD), ("FlagsEx", wt.DWORD)]
-    buf = ctypes.create_unicode_buffer(1024)
-    o = OFN()
-    o.lStructSize = ctypes.sizeof(OFN)
-    o.lpstrFilter = "G-code (*.gcode;*.3mf)\0*.gcode;*.3mf\0All files\0*.*\0\0"
-    o.lpstrFile, o.nMaxFile = ctypes.cast(buf, wt.LPWSTR), 1024
-    o.lpstrTitle = "Send G-code to the printer"
-    o.Flags = 0x00001000 | 0x00000800 | 0x00080000 | 0x00000008   # FILEMUSTEXIST | PATHMUSTEXIST | EXPLORER | NOCHANGEDIR
-    if not ctypes.windll.comdlg32.GetOpenFileNameW(ctypes.byref(o)):
-        return ""
-    return buf.value
+    def _pick_gcode():
+        """Windows 'Open' dialog for a .gcode / .gcode.3mf file; returns the path or ''."""
+        class OFN(ctypes.Structure):
+            _fields_ = [("lStructSize", wt.DWORD), ("hwndOwner", wt.HWND), ("hInstance", wt.HINSTANCE),
+                        ("lpstrFilter", wt.LPCWSTR), ("lpstrCustomFilter", wt.LPWSTR), ("nMaxCustFilter", wt.DWORD),
+                        ("nFilterIndex", wt.DWORD), ("lpstrFile", wt.LPWSTR), ("nMaxFile", wt.DWORD),
+                        ("lpstrFileTitle", wt.LPWSTR), ("nMaxFileTitle", wt.DWORD), ("lpstrInitialDir", wt.LPCWSTR),
+                        ("lpstrTitle", wt.LPCWSTR), ("Flags", wt.DWORD), ("nFileOffset", wt.WORD),
+                        ("nFileExtension", wt.WORD), ("lpstrDefExt", wt.LPCWSTR), ("lCustData", wt.LPARAM),
+                        ("lpfnHook", ctypes.c_void_p), ("lpTemplateName", wt.LPCWSTR), ("pvReserved", ctypes.c_void_p),
+                        ("dwReserved", wt.DWORD), ("FlagsEx", wt.DWORD)]
+        buf = ctypes.create_unicode_buffer(1024)
+        o = OFN()
+        o.lStructSize = ctypes.sizeof(OFN)
+        o.lpstrFilter = "G-code (*.gcode;*.3mf)\0*.gcode;*.3mf\0All files\0*.*\0\0"
+        o.lpstrFile, o.nMaxFile = ctypes.cast(buf, wt.LPWSTR), 1024
+        o.lpstrTitle = "Send G-code to the printer"
+        o.Flags = 0x00001000 | 0x00000800 | 0x00080000 | 0x00000008   # FILEMUSTEXIST | PATHMUSTEXIST | EXPLORER | NOCHANGEDIR
+        if not ctypes.windll.comdlg32.GetOpenFileNameW(ctypes.byref(o)):
+            return ""
+        return buf.value
 
 
-def _open_url(url):
-    """Open a URL in the default browser without Python process APIs (not audited)."""
-    r = ctypes.windll.shell32.ShellExecuteW(None, "open", url, None, None, 1)
-    if r <= 32:
-        raise OSError("cannot open the browser (%d)" % r)
+    def _open_url(url):
+        """Open a URL in the default browser without Python process APIs (not audited)."""
+        r = ctypes.windll.shell32.ShellExecuteW(None, "open", url, None, None, 1)
+        if r <= 32:
+            raise OSError("cannot open the browser (%d)" % r)
+
+
+else:
+    def _desktop_env():
+        """Keep AppImage runtime libraries and GTK modules out of host desktop tools."""
+        env = os.environ.copy()
+        appdir = env.get("APPDIR")
+        if not appdir:
+            return env
+        root = Path(appdir).resolve()
+        for name in ("LD_LIBRARY_PATH", "GIO_EXTRA_MODULES", "XDG_DATA_DIRS", "GSETTINGS_SCHEMA_DIR",
+                     "GDK_PIXBUF_MODULEDIR", "GDK_PIXBUF_MODULE_FILE"):
+            if name in env:
+                paths = [path for path in env[name].split(os.pathsep)
+                         if path and not Path(path).resolve().is_relative_to(root)]
+                if paths:
+                    env[name] = os.pathsep.join(paths)
+                else:
+                    env.pop(name)
+        return env
+
+    def _pick_gcode():
+        """Use a desktop-native dialog when available, including on Wayland."""
+        title = "Send G-code to the printer"
+        kde = "KDE" in os.environ.get("XDG_CURRENT_DESKTOP", "").upper().split(":")
+        dialogs = [
+            ("zenity", "--file-selection", "--title=" + title, "--file-filter=G-code | *.gcode *.3mf",
+             "--file-filter=All files | *"),
+            ("kdialog", "--title", title, "--getopenfilename", str(Path.home()), "*.gcode *.3mf|G-code"),
+        ]
+        for command in reversed(dialogs) if kde else dialogs:
+            if shutil.which(command[0]):
+                try:
+                    result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=_desktop_env())
+                except OSError:
+                    continue
+                if result.returncode == 0:
+                    return os.fsdecode(result.stdout.removesuffix(b"\n"))
+                if result.returncode == 1 and not result.stderr:
+                    return ""
+        # This call runs in the command worker, with its own Tk event loop.
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+
+            root = tk.Tk()
+            try:
+                root.withdraw()
+                return filedialog.askopenfilename(parent=root, title=title, filetypes=[
+                    ("G-code", ("*.gcode", "*.3mf")), ("All files", "*")])
+            finally:
+                root.destroy()
+        except (ImportError, RuntimeError) as error:
+            raise RuntimeError("Install Zenity or KDialog to select G-code files.") from error
+        except tk.TclError as error:
+            raise RuntimeError("No graphical file chooser is available. Check your display and install Zenity or KDialog.") from error
+
+    def _open_url(url):
+        opener = shutil.which("xdg-open")
+        if not opener:
+            raise OSError("Install xdg-utils to open your default browser.")
+        process = subprocess.Popen([opener, url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=_desktop_env())
+        try:
+            code = process.wait(timeout=0.3)
+        except subprocess.TimeoutExpired:
+            threading.Thread(target=process.wait, daemon=True, name="cc2-browser").start()
+        else:
+            if code:
+                raise OSError("xdg-open could not launch the browser (exit %d)." % code)
 
 
 class LoginProxy:
     UPSTREAM = "https://account.elegoo.com"
     DROP_RESP = {"transfer-encoding", "content-length", "connection", "content-security-policy",
                  "content-security-policy-report-only", "x-frame-options", "strict-transport-security",
-                 "alt-svc", "report-to", "nel", "keep-alive"}
+                 "alt-svc", "report-to", "nel", "keep-alive", "cache-control", "etag", "last-modified"}
     DROP_REQ = {"host", "origin", "referer", "connection", "content-length", "accept-encoding", "keep-alive",
-                "upgrade-insecure-requests", "transfer-encoding", "te", "proxy-connection"}
+                "upgrade-insecure-requests", "transfer-encoding", "te", "proxy-connection",
+                "if-none-match", "if-modified-since"}
 
     def __init__(self, on_msg, log):
         self.on_msg, self.log = on_msg, log
@@ -289,9 +388,12 @@ class LoginProxy:
         self.port = 0
         self.nonce = uuid.uuid4().hex
         self.stopped = False
+        self.connections = set()
+        self.connections_lock = threading.Lock()
+        self.lifecycle_lock = threading.Lock()
 
     # ---- lifecycle
-    def start(self):
+    def _start_windows(self):
         _wsa()
         s = _ws.socket(2, 1, 6)
         if s == _INVALID_SOCK:
@@ -304,10 +406,11 @@ class LoginProxy:
         _ws.getsockname(s, ctypes.byref(sa), ctypes.byref(n))
         self.port = ((sa.port & 0xFF) << 8) | (sa.port >> 8)
         self.sock = s
-        threading.Thread(target=self._accept_loop, daemon=True, name="cc2-proxy").start()
+        self.thread = threading.Thread(target=self._accept_windows, daemon=True, name="cc2-proxy")
+        self.thread.start()
         return self.port
 
-    def stop(self):
+    def _stop_windows(self):
         if self.stopped:
             return
         self.stopped = True
@@ -318,8 +421,9 @@ class LoginProxy:
             _ws.closesocket(w)
         except Exception:
             pass
+        self.thread.join(timeout=1)
 
-    def _accept_loop(self):
+    def _accept_windows(self):
         s = self.sock
         try:
             while not self.stopped:
@@ -337,12 +441,17 @@ class LoginProxy:
     # ---- socket helpers
     @staticmethod
     def _recv(c, n=65536):
+        if not IS_WINDOWS:
+            return c.recv(n)
         buf = ctypes.create_string_buffer(n)
         got = _ws.recv(c, buf, n, 0)
         return buf.raw[:got] if got > 0 else b""
 
     @staticmethod
     def _send_all(c, data):
+        if not IS_WINDOWS:
+            c.sendall(data)
+            return True
         mv, off = memoryview(data), 0
         while off < len(data):
             chunk = bytes(mv[off:off + 65536])
@@ -351,6 +460,89 @@ class LoginProxy:
                 return False
             off += n
         return True
+
+    def start(self):
+        if IS_WINDOWS:
+            return self._start_windows()
+        return self._start_linux(0)
+
+    def _start_linux(self, port):
+        with self.lifecycle_lock:
+            if self.sock is not None:
+                return self.port
+            return self._bind_linux(port)
+
+    def _bind_linux(self, port):
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            listener.bind(("127.0.0.1", port))
+            listener.listen(32)
+            listener.settimeout(0.2)
+            self.port = listener.getsockname()[1]
+            self.sock = listener
+            self.stopped = False
+            self.thread = threading.Thread(target=self._accept_linux, args=(listener,), daemon=True, name="cc2-loopback")
+            self.thread.start()
+            return self.port
+        except BaseException:
+            listener.close()
+            self.sock = None
+            raise
+
+    def stop(self):
+        if IS_WINDOWS:
+            self._stop_windows()
+        else:
+            with self.lifecycle_lock:
+                if self.sock is None:
+                    return
+                self.stopped = True
+                self.thread.join()
+                self.sock = None
+                with self.connections_lock:
+                    for client in self.connections:
+                        self._close_client(client)
+
+    def _accept_linux(self, listener):
+        with listener:
+            while not self.stopped:
+                try:
+                    client, _ = listener.accept()
+                except socket.timeout:
+                    continue
+                except OSError as error:
+                    self.log("loopback accept: %s" % error)
+                    break
+                with self.connections_lock:
+                    self.connections.add(client)
+                threading.Thread(target=self._serve, args=(client,), daemon=True, name="cc2-loopback-client").start()
+
+    def _client_timeout(self, client, seconds):
+        if IS_WINDOWS:
+            timeout = ctypes.c_int(seconds * 1000)
+            _ws.setsockopt(client, 0xFFFF, 0x1006, ctypes.byref(timeout), 4)
+        else:
+            client.settimeout(seconds)
+
+    def _close_client(self, client):
+        if IS_WINDOWS:
+            _ws.shutdown(client, 2)
+            _ws.closesocket(client)
+        else:
+            try:
+                client.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            client.close()
+
+    def _finish_client(self, client):
+        if IS_WINDOWS:
+            self._close_client(client)
+        else:
+            with self.connections_lock:
+                self.connections.discard(client)
+                self._close_client(client)
 
     def _reply(self, c, status, body=b"", headers=None, reason="OK", head=False):
         h = [("Content-Length", str(len(body))), ("Connection", "close"), ("Cache-Control", "no-store")]
@@ -361,8 +553,7 @@ class LoginProxy:
     # ---- request handling
     def _serve(self, c):
         try:
-            to = ctypes.c_int(20000)
-            _ws.setsockopt(c, 0xFFFF, 0x1006, ctypes.byref(to), 4)  # SO_RCVTIMEO
+            self._client_timeout(c, 20)
             data = b""
             while b"\r\n\r\n" not in data and len(data) < 65536:
                 chunk = self._recv(c)
@@ -385,7 +576,7 @@ class LoginProxy:
             if hdrs.get("transfer-encoding"):
                 return self._reply(c, 411, b"length required", reason="Length Required")
             need = int(hdrs.get("content-length", "0") or 0)
-            if need > 4 * 1024 * 1024 or not target.startswith("/"):
+            if not 0 <= need <= 4 * 1024 * 1024 or not target.startswith("/"):
                 return self._reply(c, 400, b"bad request", reason="Bad Request")
             body = rest
             while len(body) < need:
@@ -405,11 +596,7 @@ class LoginProxy:
             except Exception:
                 pass
         finally:
-            try:
-                _ws.shutdown(c, 2)
-                _ws.closesocket(c)
-            except Exception:
-                pass
+            self._finish_client(c)
 
     def _wx(self, c, body):
         try:
@@ -543,43 +730,144 @@ def _ms(v):
     return int(v if v > 1e12 else v * 1000)
 
 
+def _atomic_write(path, data, *, create_only=False):
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    output = tempfile.NamedTemporaryFile(dir=path.parent, delete=False)
+    temp = Path(output.name)
+    try:
+        with output:
+            output.write(data)
+            output.flush()
+            os.fsync(output.fileno())
+        if create_only:
+            try:
+                os.link(temp, path)
+            except FileExistsError:
+                pass
+        else:
+            temp.replace(path)
+    finally:
+        temp.unlink(missing_ok=True)
+
+
+_KEYRING_MARKER = b"CC2:SecretService:v1"
+_AES_PREFIX = b"CC2:AESGCM:v1:"
+
+
+def _secret_tool(action, data=None):
+    """Communicate with Secret Service using stdin/stdout, with no token in argv."""
+    tool = shutil.which("secret-tool")
+    if not tool or not os.environ.get("DBUS_SESSION_BUS_ADDRESS"):
+        return None
+    command = [tool, action]
+    if action == "store":
+        command += ["--label", "OrcaSlicer Elegoo CC2 Cloud"]
+    profile = hashlib.sha256(os.fsencode(_DATA.resolve())).hexdigest()
+    command += ["application", AGENT_ID, "profile", profile]
+    try:
+        result = subprocess.run(command, input=data, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=8, env=_desktop_env())
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return result.stdout if result.returncode == 0 else None
+
+
+def _linux_key(*, create=False):
+    try:
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    except ImportError as error:
+        raise RuntimeError("Install the plugin's cryptography dependency to use encrypted local storage.") from error
+
+    machine_id = b""
+    for path in (Path("/etc/machine-id"), Path("/var/lib/dbus/machine-id")):
+        try:
+            machine_id = path.read_bytes().strip()
+        except FileNotFoundError:
+            continue
+        if machine_id:
+            break
+    if not machine_id:
+        raise RuntimeError("An initialized Linux machine-id is required for local session encryption.")
+    key_file = _DATA / "cc2_session.key"
+    if create and not key_file.exists():
+        _atomic_write(key_file, os.urandom(32), create_only=True)
+    # The machine ID and UID bind the key to this installation, but provide no secret entropy.
+    with os.fdopen(os.open(key_file, os.O_RDONLY | os.O_NOFOLLOW), "rb") as handle:
+        metadata = os.fstat(handle.fileno())
+        if metadata.st_uid != os.getuid() or metadata.st_mode & 0o077:
+            raise PermissionError("The CC2 session key must be owned by this user and have mode 0600.")
+        secret = handle.read(33)
+    if len(secret) != 32:
+        raise ValueError("Invalid CC2 session key.")
+    context = b"OrcaSlicer Elegoo CC2 session v1:" + machine_id + b":" + str(os.getuid()).encode("ascii")
+    return AESGCM(hmac.digest(secret, context, "sha256"))
+
+
 class Session:
     """The plugin's own Elegoo login (never ElegooSlicer's refresh token)."""
 
     def __init__(self):
         self.d = None
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
 
     def get(self):
         with self.lock:
             if self.d is None:
-                for path in (SESSION_FILE, os.path.join(_HERE, "cc2_session.dat")):   # old location as a fallback
+                if IS_WINDOWS:
+                    for path in (SESSION_FILE, _HERE / "cc2_session.dat"):
+                        try:
+                            self.d = json.loads(_dpapi(_read_bytes(path)))
+                            break
+                        except Exception:
+                            self.d = {}
+                else:
                     try:
-                        self.d = json.loads(_dpapi(_read_bytes(path)).decode("utf-8"))
-                        break
-                    except Exception:
+                        data = _read_bytes(SESSION_FILE)
+                    except FileNotFoundError:
                         self.d = {}
+                    else:
+                        if data == _KEYRING_MARKER:
+                            secret = _secret_tool("lookup")
+                            if secret is None:
+                                return {}  # retry once the keyring is unlocked
+                        elif data.startswith(_AES_PREFIX):
+                            payload = data[len(_AES_PREFIX):]
+                            try:
+                                secret = _linux_key().decrypt(payload[:12], payload[12:], _AES_PREFIX)
+                            except Exception as error:
+                                print("CC2: cannot read the encrypted session (%s)." % type(error).__name__, file=sys.stderr)
+                                return {}
+                        else:
+                            raise ValueError("Unrecognized CC2 session file.")
+                        self.d = json.loads(secret)
             return dict(self.d)
 
     def save(self, d):
         with self.lock:
+            secret = json.dumps(d).encode("utf-8")
+            if IS_WINDOWS:
+                stored = _protect(secret)
+            elif d.get("token") and _secret_tool("store", secret) is not None:
+                stored = _KEYRING_MARKER
+            else:
+                nonce = os.urandom(12)
+                stored = _AES_PREFIX + nonce + _linux_key(create=True).encrypt(nonce, secret, _AES_PREFIX)
+            _atomic_write(SESSION_FILE, stored)
             self.d = dict(d)
-            os.makedirs(os.path.dirname(SESSION_FILE), exist_ok=True)
-            with open(SESSION_FILE, "wb") as f:
-                f.write(_protect(json.dumps(self.d).encode("utf-8")))
 
     def update(self, **kw):
-        d = self.get()
-        d.update(kw)
-        self.save(d)
+        with self.lock:
+            d = self.get()
+            d.update(kw)
+            self.save(d)
 
     def clear(self):
         with self.lock:
+            if IS_WINDOWS:
+                (_HERE / "cc2_session.dat").unlink(missing_ok=True)
+            else:
+                _secret_tool("clear")
+            SESSION_FILE.unlink(missing_ok=True)
             self.d = {}
-            try:
-                os.remove(SESSION_FILE)
-            except OSError:
-                pass
 
     def logged_in(self):
         return bool(self.get().get("token"))
@@ -587,7 +875,7 @@ class Session:
 
 SESSION = Session()
 
-PREFS_FILE = os.path.join(_DATA, "cc2_prefs.json")
+PREFS_FILE = _DATA / "cc2_prefs.json"
 OPEN_OK = ("https://0xpraet0rian.github.io/", "https://github.com/0xpraet0rian")
 
 
@@ -610,9 +898,7 @@ def _prefs_set(theme=None, cam=None, autostart=None):
         d["cam"] = bool(cam)
     if autostart is not None:
         d["autostart"] = bool(autostart)
-    os.makedirs(os.path.dirname(PREFS_FILE), exist_ok=True)
-    with open(PREFS_FILE, "w", encoding="utf-8") as f:
-        json.dump(d, f)
+    _atomic_write(PREFS_FILE, json.dumps(d).encode("utf-8"))
     return d
 
 
@@ -702,6 +988,7 @@ class Hub:
         self.printer_online = True
         self.devices = []
         self.login_proxy = None
+        self.login_timer = None
         self.connect_lock = threading.Lock()
         self.samples = collections.deque(maxlen=1800)     # [t_ms, nozzle, nozzle_t, bed, bed_t, chamber, model%, aux%, case%]
         self.cmdlog = collections.deque(maxlen=400)       # commands sent to the printer (console)
@@ -1103,25 +1390,30 @@ class Hub:
     def start_browser_login(self):
         d = SESSION.get()
         dev_id = d.get("deviceId") or uuid.uuid4().hex
-        if not d.get("deviceId"):
-            SESSION.update(deviceId=dev_id)
         self._stop_login_proxy()
-        px = LoginProxy(self._on_login_msg, self.log)
+        px = LoginProxy(lambda data: self._on_login_msg(data, dev_id, px), self.log)
         port = px.start()
         self.login_proxy = px
         url = "http://127.0.0.1:%d/account/slicer-login?region=global&theme=light&deviceId=%s" % (port, dev_id)
-        _open_url(url)
+        try:
+            _open_url(url)
+        except Exception:
+            self._stop_login_proxy()
+            raise
         self.log("sign-in page opened in your browser (local pass-through on 127.0.0.1:%d)" % port)
-        t = threading.Timer(900, self._stop_login_proxy)
-        t.daemon = True
-        t.start()
+        self.login_timer = threading.Timer(900, px.stop)
+        self.login_timer.daemon = True
+        self.login_timer.start()
 
     def _stop_login_proxy(self):
+        timer, self.login_timer = self.login_timer, None
+        if timer:
+            timer.cancel()
         px, self.login_proxy = self.login_proxy, None
         if px:
             px.stop()
 
-    def _on_login_msg(self, data):
+    def _on_login_msg(self, data, device_id, proxy):
         """Messages from the Elegoo sign-in page (same bridge ElegooSlicer uses). Only method names are logged."""
         try:
             if isinstance(data, str):
@@ -1130,7 +1422,7 @@ class Hub:
             self.log("sign-in page message: %s" % (m or type(data).__name__))
             if m == "report.userInfo":
                 self.log("sign-in page reported user info; fields: %s" % sorted(_dict(data.get("params")).keys()))
-                threading.Thread(target=self._store_login, args=(_dict(data.get("params")),), daemon=True).start()
+                threading.Thread(target=self._store_login, args=(_dict(data.get("params")), device_id, proxy), daemon=True).start()
             elif m == "report.websiteOpen":
                 url = str(_dict(data.get("params")).get("url", ""))
                 if url.startswith("https://"):
@@ -1138,7 +1430,9 @@ class Hub:
         except Exception as e:
             self.log("sign-in message error: %r" % e)
 
-    def _store_login(self, u):
+    def _store_login(self, u, device_id, proxy):
+        if proxy is not self.login_proxy or proxy.stopped:
+            return
         try:
             tok = u.get("accessToken") or u.get("token")
             if not tok:
@@ -1146,12 +1440,13 @@ class Hub:
             keep = SESSION.get()
             SESSION.save({"token": tok, "refreshToken": u.get("refreshToken", ""), "exp": _ms(u.get("expiresTime")),
                           "userId": str(u.get("userId", "")), "email": u.get("email", ""),
-                          "nickname": u.get("nickname", ""), "deviceId": keep.get("deviceId", ""),
+                          "nickname": u.get("nickname", ""), "deviceId": device_id,
                           "source": "own", "sn": keep.get("sn", "")})
             self.log("signed in")
-            t = threading.Timer(5, self._stop_login_proxy)
-            t.daemon = True
-            t.start()
+            if proxy:
+                t = threading.Timer(5, proxy.stop)
+                t.daemon = True
+                t.start()
             try:
                 self.fetch_creds()
             except Exception as e:
@@ -1161,8 +1456,11 @@ class Hub:
             self._auto_connect()
         except Exception as e:
             self.log("store login: %s" % e)
+            self._post({"type": "note", "kind": "bad", "text": "Could not save the Elegoo session: " + str(e)})
 
     def import_from_elegooslicer(self):
+        if not IS_WINDOWS:
+            raise RuntimeError("Use Sign in with Elegoo on Linux.")
         u = _elegoo_user()
         if not u.get("token"):
             raise RuntimeError("ElegooSlicer has no active login")
@@ -1345,7 +1643,7 @@ class Hub:
                     "uid": a.get("rtcUserId")}
         return self.creds
 
-    def ensure_login(self, timeout=25):
+    def ensure_login(self, timeout=40):
         if self.rtm_online:
             return True
         with self.login_lock:
@@ -1731,6 +2029,8 @@ class LanBridge(LoginProxy):
         self.lock2 = threading.Lock()
 
     def start(self):
+        if not IS_WINDOWS:
+            return self._start_linux(BRIDGE_PORT)
         _wsa()
         for port in (BRIDGE_PORT, 0):
             s = _ws.socket(2, 1, 6)
@@ -1742,7 +2042,8 @@ class LanBridge(LoginProxy):
                 _ws.getsockname(s, ctypes.byref(sa), ctypes.byref(n))
                 self.port = ((sa.port & 0xFF) << 8) | (sa.port >> 8)
                 self.sock = s
-                threading.Thread(target=self._accept_loop, daemon=True, name="cc2-bridge").start()
+                self.thread = threading.Thread(target=self._accept_windows, daemon=True, name="cc2-bridge")
+                self.thread.start()
                 return self.port
             _ws.closesocket(s)
         raise OSError("bridge: cannot bind a loopback port")
@@ -1752,8 +2053,7 @@ class LanBridge(LoginProxy):
 
     def _serve(self, c):
         try:
-            to = ctypes.c_int(60000)
-            _ws.setsockopt(c, 0xFFFF, 0x1006, ctypes.byref(to), 4)
+            self._client_timeout(c, 60)
             data = b""
             while b"\r\n\r\n" not in data and len(data) < 65536:
                 chunk = self._recv(c)
@@ -1794,11 +2094,7 @@ class LanBridge(LoginProxy):
             except Exception:
                 pass
         finally:
-            try:
-                _ws.shutdown(c, 2)
-                _ws.closesocket(c)
-            except Exception:
-                pass
+            self._finish_client(c)
 
     def _upload(self, c, hdrs, body):
         import re
@@ -1911,11 +2207,10 @@ class LanBridge(LoginProxy):
             HUB.downloads.pop(task, None)
 
 
-def _watchdog():
+def _watchdog(stop):
     """Keep the cloud link alive: when 'Connect automatically' is on and the tab is open, reconnect if the poll loop
     died or RTM dropped (e.g. after -10027, a Wi-Fi blip, or the printer coming back from sleep)."""
-    while True:
-        time.sleep(30)
+    while not stop.wait(30):
         try:
             if not (SESSION.logged_in() and SESSION.get().get("auto", True) and HUB.page_ready):
                 continue
@@ -1929,17 +2224,34 @@ def _watchdog():
 
 
 BRIDGE = None
+WATCHDOG_STOP = None
 
 
 def _start_bridge():
-    threading.Thread(target=_watchdog, daemon=True, name="cc2-watchdog").start()
-    global BRIDGE
+    global BRIDGE, WATCHDOG_STOP
+    if WATCHDOG_STOP is None:
+        WATCHDOG_STOP = threading.Event()
+        threading.Thread(target=_watchdog, args=(WATCHDOG_STOP,), daemon=True, name="cc2-watchdog").start()
+    if BRIDGE is not None:
+        return
     try:
-        BRIDGE = LanBridge(HUB.log)
-        port = BRIDGE.start()
-        HUB.log("Orca bridge listening on 127.0.0.1:%d (Elegoo Link host)" % port)
-    except Exception as e:
-        HUB.log("Orca bridge not started: %s" % e)
+        bridge = LanBridge(HUB.log)
+        port = bridge.start()
+    except OSError as error:
+        HUB.log("Orca bridge could not bind 127.0.0.1:%d: %s" % (BRIDGE_PORT, error))
+        return
+    BRIDGE = bridge
+    HUB.log("Orca bridge listening on 127.0.0.1:%d (Elegoo Link host)" % port)
+
+
+def _stop_bridge():
+    global BRIDGE, WATCHDOG_STOP
+    if WATCHDOG_STOP is not None:
+        WATCHDOG_STOP.set()
+        WATCHDOG_STOP = None
+    if BRIDGE is not None:
+        BRIDGE.stop()
+        BRIDGE = None
 
 
 # --------------------------------------------------------------------------- agent
@@ -1947,12 +2259,21 @@ class CC2Agent(pa.PrinterAgentBase):
     def __init__(self):
         super().__init__()
 
+    def on_load(self):
+        _start_bridge()
+
+    def on_unload(self):
+        _stop_bridge()
+        HUB._stop_login_proxy()
+        HUB.want_poll = False
+        HUB.stop_poll()
+
     def get_name(self):
         return "Elegoo CC2 Cloud"
 
     def get_agent_info(self):
         i = pa.AgentInfo()
-        i.id, i.name, i.version = AGENT_ID, "Elegoo CC2 (cloud)", "0.5.0"
+        i.id, i.name, i.version = AGENT_ID, "Elegoo CC2 (cloud)", "0.6.0"
         i.description = "Elegoo Centauri Carbon 2 via the Elegoo cloud"
         return i
 
@@ -2479,18 +2800,45 @@ PAGE_HTML = r"""<!doctype html><meta charset="utf-8">
     removeItem:k=>{m.delete(String(k));}, clear:()=>m.clear(), key:i=>Array.from(m.keys())[i]??null,
     get length(){return m.size;} }; }
   for(const n of ['localStorage','sessionStorage']){
-    let ok=true; try{ void window[n]; }catch(e){ ok=false; }
+    let ok=true;
+    try{ const store=window[n]; const key='__cc2_storage_test__'; store.setItem(key,'1'); store.removeItem(key); }
+    catch(e){ ok=false; }
     if(!ok){ try{ Object.defineProperty(window,n,{value:mem(),configurable:true}); }catch(e){} }
   }
 })();
 </script>
-<script src="https://cdn.jsdelivr.net/npm/agora-rtm@2.3.0/agora-rtm.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/agora-rtc-sdk-ng@4.22.0/AgoraRTC_N-production.js"></script>
 <script>
+const CC2_LINUX=__CC2_LINUX__;
 const $=id=>document.getElementById(id); const dec=new TextDecoder();
 let rtm=null, C=null, GEN=0, off=null;
 function P(o){ try{ orca.postMessage(o);}catch(e){ L('bridge error '+e);} }
 function L(s){ const l=$('log'); l.textContent+=s+'\n'; l.scrollTop=l.scrollHeight; }
+
+const AGORA_SDK={
+  AgoraRTM:'https://cdn.jsdelivr.net/npm/agora-rtm@2.3.0/agora-rtm.js',
+  AgoraRTC:'https://cdn.jsdelivr.net/npm/agora-rtc-sdk-ng@4.22.0/AgoraRTC_N-production.js'
+};
+const sdkLoads={};
+function loadAgora(name){
+  if(window[name]) return Promise.resolve(window[name]);
+  if(!sdkLoads[name]){
+    const load=url=>new Promise((resolve,reject)=>{
+      const script=document.createElement('script');
+      const finish=()=>{
+        clearTimeout(timer);
+        script.remove();
+        if(window[name]) resolve(window[name]); else reject(new Error(name+' SDK unavailable. Check HTTPS access to cdn.jsdelivr.net.'));
+      };
+      const timer=setTimeout(finish,12000);
+      script.onload=script.onerror=finish;
+      script.src=url;
+      document.head.appendChild(script);
+    });
+    sdkLoads[name]=load(AGORA_SDK[name]).catch(()=>load(AGORA_SDK[name]+'?cc2-retry='+Date.now()))
+      .finally(()=>{ delete sdkLoads[name]; });
+  }
+  return sdkLoads[name];
+}
 
 /* ---------- RTM transport (unchanged protocol) ---------- */
 window.addEventListener('pagehide',()=>{ try{ if(rtm) rtm.logout(); }catch(e){} });
@@ -2502,7 +2850,8 @@ async function doLogin(cfg,gen){
   C=cfg; GEN=gen; setChip('cRtm','RTM: logging in','warn');
   try{
     await drop();
-    const {RTM}=AgoraRTM;
+    const {RTM}=await loadAgora('AgoraRTM');
+    if(gen!==GEN) return;
     const r=new RTM(cfg.appId,cfg.rtmUserId,{presenceTimeout:15,heartbeatInterval:5});
     const onStatus=e=>{ if(gen!==GEN) return; setChip('cRtm','RTM: '+String(e.state).toLowerCase(), String(e.state)==='CONNECTED'?'ok':'warn'); P({type:'rtm_status',gen,state:e.state,reason:e.reason}); };
     const onExp=()=>{ if(gen===GEN) P({type:'token_expiring',gen}); };
@@ -2624,6 +2973,7 @@ function renderAccount(a){
 }
 async function loadAccount(){ try{ renderAccount(await call('acct_status')); }catch(e){ note('Account: '+e.message,'bad'); } }
 $('bSign').onclick=()=>run('Sign-in page opened in your browser','acct_login').catch(()=>{});
+$('bImport').hidden=CC2_LINUX;
 $('bImport').onclick=()=>run('Session imported','acct_import').then(renderAccount).catch(()=>{});
 $('bOut').onclick=()=>run('Signed out','acct_logout').then(renderAccount).catch(()=>{});
 $('aDev').onchange=e=>run('Printer selected','acct_select',{sn:e.target.value}).then(renderAccount).catch(()=>{});
@@ -2666,9 +3016,12 @@ async function camStop(){
   if(CAM){ const c=CAM; CAM=null; try{ c.removeAllListeners(); await c.leave(); }catch(e){} }
 }
 async function camStart(){
-  if(typeof AgoraRTC==='undefined'){ camMsg('The RTC SDK did not load (no internet access to cdn.jsdelivr.net?)',true); L('AgoraRTC script missing'); return; }
   camMsg('Connecting to the camera...'); $('bCam').disabled=true; CAMERR=''; SUBS.clear(); PLAYING=false;
   try{
+    const AgoraRTC=await loadAgora('AgoraRTC');
+    if(CC2_LINUX && (typeof RTCPeerConnection!=='function' || !AgoraRTC.checkSystemRequirements())){
+      camMsg('This WebView does not provide the WebRTC features required by Agora.',true); return;
+    }
     const cfg=await call('cam_creds',{},30000);
     try{ AgoraRTC.setLogLevel(3); AgoraRTC.disableLogUpload&&AgoraRTC.disableLogUpload(); }catch(e){}
     const c=AgoraRTC.createClient({mode:'live',codec:'vp8'}); CAM=c;
@@ -2854,7 +3207,7 @@ function addCmd(e){
 }
 $('bConClear').onclick=()=>{ CON.innerHTML='<span class="mut">Cleared.</span>'; CONN=0; call('cmdlog_clear').catch(()=>{}); };
 
-if(typeof AgoraRTM==='undefined'){ setChip('cRtm','RTM: SDK not loaded','bad'); L('AgoraRTM script failed to load'); }
+loadAgora('AgoraRTM').catch(()=>{ setChip('cRtm','RTM: SDK not loaded','bad'); L('Check HTTPS access to cdn.jsdelivr.net, then retry Connect.'); });
 P({type:'ready'});
 setTimeout(loadAccount,600);
 </script>
@@ -2869,20 +3222,26 @@ class CC2Page(orca.pages.PagesPluginCapabilityBase):
     def get_name(self):
         return "Elegoo CC2"
 
+    def on_unload(self):
+        HUB.page = None
+        HUB.page_ready = False
+        HUB.rtm_online = False
+        HUB._stop_login_proxy()
+
     def get_icon(self):
         try:  # next to the plugin file, which lives under Orca's data dir (allowed root)
-            path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "elegoo_cc2_icon.svg")
+            path = _HERE / "elegoo_cc2_icon.svg"
             if not os.path.exists(path):
                 with open(path, "w", encoding="utf-8") as f:
                     f.write(ICON_SVG)
-            return path
+            return str(path)
         except Exception:
             return ""
 
     def get_ui(self):
         HUB.page_ready = False
         HUB.rtm_online = False
-        return PAGE_HTML
+        return PAGE_HTML.replace("__CC2_LINUX__", "true" if IS_LINUX else "false")
 
     def on_message(self, data):
         HUB.on_page_message(data)
@@ -2897,4 +3256,3 @@ class ElegooCC2Plugin(orca.base):
             HUB.log("request_permissions failed: %r" % e)
         orca.register_capability(CC2Page)
         orca.register_capability(CC2Agent)
-        _start_bridge()

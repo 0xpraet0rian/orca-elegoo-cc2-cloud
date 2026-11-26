@@ -13,7 +13,7 @@
   <img alt="OrcaSlicer" src="https://img.shields.io/badge/OrcaSlicer-2.5.x-4f8cff?style=flat-square">
   <img alt="Printer" src="https://img.shields.io/badge/printer-Centauri%20Carbon%202-313134?style=flat-square">
   <img alt="Python" src="https://img.shields.io/badge/python-3.12%2B-3776ab?style=flat-square">
-  <img alt="Platform" src="https://img.shields.io/badge/platform-Windows-0078d4?style=flat-square">
+  <img alt="Platform" src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux-0078d4?style=flat-square">
   <img alt="Dependencies" src="https://img.shields.io/badge/dependencies-none-4cc38a?style=flat-square">
   <img alt="License" src="https://img.shields.io/badge/license-PolyForm%20NC%201.0.0-b45309?style=flat-square">
   <img alt="Status" src="https://img.shields.io/badge/status-v0.5%20experimental-f59e0b?style=flat-square">
@@ -27,7 +27,7 @@
 |---|---|
 | **Print from Orca** | Slice and press Orca's normal *Print* button. A small local bridge answers as an Elegoo Link printer, the plugin uploads the file to the Elegoo cloud, the printer downloads it and the print **starts by itself** (filament slots matched by filament type; switch off with *Start after Orca upload*) |
 | **Built-in guide** | A *Guide* button next to the theme selector opens a pop-up that explains the one-time setup, the upload and the automatic start |
-| **Send G-code** | A button in the tab: pick a `.gcode` or `.gcode.3mf` with the Windows file dialog and upload it to the printer, then start it from *Printer files* |
+| **Send G-code** | A button in the tab: pick a `.gcode` or `.gcode.3mf` with the native file dialog and upload it to the printer, then start it from *Printer files* |
 | **Control tab** | Print (pause, resume, stop, speed), temperatures, motion with homing, fans, light, Canvas filament load and unload, files, print history |
 | **Camera** | Live view from the printer. It starts by itself when the printer connects (switch off with *Auto-start*), and the picture can be resized or shown full screen |
 | **Layout** | Two balanced columns (Print, Motion with a big X / Y / Z read-out, Console | Temperature and Fans with their graphs), then Camera, Filament and Files full width; one column on narrow windows |
@@ -38,7 +38,7 @@
 | **Command console** | Every command sent to the printer, from the tab or from Orca (motion, temperatures, fans, light, speed, filament, uploads, prints), with the result and how long it took |
 | **Paging** | Files and print history have page buttons and a page size |
 | **Stays connected** | A watchdog reconnects the cloud link when it drops while the tab is open, and Orca's disconnect calls no longer tear it down |
-| **Own sign-in** | Signs in with Elegoo's own page in your browser; the session is stored encrypted (Windows DPAPI) and survives plugin reinstalls |
+| **Own sign-in** | Signs in with Elegoo's own page in your browser; the session is stored using DPAPI, Secret Service, or local AES-GCM encryption and survives plugin reinstalls |
 | **Themes** | *Simple dark* (default), *Simple white* and *0xpraet0rian* (navy and orange); the choice is saved |
 | **No dependencies** | One Python file and the standard library; everything native goes through `ctypes` |
 
@@ -67,7 +67,8 @@ An early, personal-use build, developed against one printer. What is known:
 1. In Orca: **Preferences → Developer → Experimental Features**, enable
    *Use printer agents instead of print hosts*.
 2. **Plugins → Install local plugin**, choose
-   [`plugin/elegoo_cc2_cloud_win_x86_64.py`](plugin/elegoo_cc2_cloud_win_x86_64.py) and accept the permission dialog.
+   [Windows x86_64](plugin/elegoo_cc2_cloud_win_x86_64.py) or
+   [Linux x86_64](plugin/elegoo_cc2_cloud_linux_x86_64.py), then accept the permission dialog.
 3. In the CC2 printer preset set **Printer Agent** to *Elegoo CC2 (cloud)*.
 4. Open the **Elegoo CC2** tab and press **Sign in with Elegoo**. The sign-in page opens in your browser.
    After signing in, the tab connects by itself (*Connect automatically*). Keep the tab open while you print.
@@ -77,10 +78,36 @@ An early, personal-use build, developed against one printer. What is known:
 
 Notes:
 
-- Orca requires the file name to end with the OS and architecture (`_win_x86_64`).
 - **Close ElegooSlicer** while connected: the Elegoo account allows one cloud session at a time.
 - Reinstalling a plugin makes Orca delete its folder. The session and settings are kept outside it, so you do not
   have to sign in again after an update.
+
+### Linux x86_64 (Wayland and X11)
+
+Install an OrcaSlicer 2.5.x build with Python plugins enabled, then follow the steps above with the Linux file.
+On Arch Linux install the desktop tools, choosing Zenity or KDialog for the picker.
+
+```sh
+sudo pacman -S xdg-utils zenity
+# KDE users can install kdialog in place of zenity.
+# Optional for Secret Service with GNOME Keyring:
+sudo pacman -S libsecret gnome-keyring
+```
+
+On other distributions install the equivalent tools (`xdg-open` from `xdg-utils`, and `zenity` or `kdialog`).
+With neither picker available the plugin tries Tk when the embedded Python provides it and an X display is available.
+GNOME Keyring or a KWallet installation exposing Freedesktop Secret Service must be running and unlocked in your
+desktop session for `secret-tool` (from `libsecret`, or `libsecret-tools` on Debian-based distributions) to work.
+Orca's installer resolves the Linux-only `cryptography` dependency declared in the script for the AES-GCM fallback.
+
+On Wayland, launch Orca normally first. If its embedded WebView fails to render or the file dialog fails to appear,
+try `GDK_BACKEND=x11 orca-slicer` with XWayland installed. Camera playback requires WebRTC with VP8 and an
+Agora-compatible WebView. If the SDK fails to load, check HTTPS access to `cdn.jsdelivr.net` and your system CA
+certificates. Allow required network and process requests when Orca prompts. Sandboxed packages also need
+access to the selected file and desktop services for the picker, browser and keyring.
+
+If another process owns `127.0.0.1:47890`, Linux reports the bind failure in the tab's command console.
+Close the other listener and reload the plugin to retry. [OrcaSlicer plugin installation](https://github.com/OrcaSlicer/OrcaSlicer/wiki/plugins_getting_started)
 
 ## Using the tab
 
@@ -96,14 +123,18 @@ Notes:
 
 - **Sign-in**: the page is served to your browser through a loopback server on `127.0.0.1` started by the plugin, so
   your password passes through the plugin's memory on its way to Elegoo. It is never stored or logged. Only the
-  session Elegoo returns is kept, encrypted with Windows DPAPI.
-- **Where things are stored**: `<Orca data dir>/plugin_data/elegoo_cc2_cloud/` holds the encrypted session and the
-  settings file.
+  session Elegoo returns is kept. Windows uses DPAPI. Linux prefers Secret Service when available at sign-in and
+  otherwise uses AES-GCM with a per-user random secret bound to the machine ID and UID.
+- **Where things are stored**: Windows uses `<Orca data dir>/plugin_data/elegoo_cc2_cloud/`. Linux uses
+  `${XDG_CONFIG_HOME:-$HOME/.config}/OrcaSlicer/plugin_data/elegoo_cc2_cloud/`. With Secret Service, the local
+  session file holds a marker and the keyring holds the session. The encrypted fallback and its random key file
+  both have mode `0600`. Protect both files in backups. Anyone who can read both and knows the machine ID and UID
+  can decrypt the session.
 - **Local bridge**: the plugin listens on `127.0.0.1:47890` (loopback only, requests with another Host header are refused)
   and accepts the two requests Orca's Elegoo Link host makes; nothing else is served.
 - **What leaves the PC**: requests to the Elegoo cloud (`account.elegoo.com`, `matrix.elegoo.com`, its storage and
   Agora) and the two Agora SDKs loaded from `cdn.jsdelivr.net` when the tab opens.
-- A separate *Use ElegooSlicer session* button can import the token of an installed ElegooSlicer instead (token
+- On Windows, a separate *Use ElegooSlicer session* button can import the token of an installed ElegooSlicer instead (token
   only, read once).
 
 ## How it works
@@ -129,8 +160,8 @@ printer the *Print plate* path that would reach a printer agent cannot be select
 the printer on the loopback, sends the file to the cloud itself and then issues the start (`1020`) with the slot map.
 
 The cloud only accepts commands over Agora RTM and has no Python client, so the plugin runs the Agora web SDKs in
-an Orca page and passes JSON to and from Python. Orca's audit hook does not cover `ctypes`, and its message
-bridge ignores the Elegoo sign-in page's messages, hence the Windows HTTP and socket code. Details and the message
+an Orca page and passes JSON to and from Python. The Windows backend uses WinHTTP and Winsock. The Linux backend
+uses Python HTTP and TCP sockets. Both serve the browser sign-in bridge on loopback. Details and the message
 tables are in [docs/PROTOCOL.md](docs/PROTOCOL.md).
 
 ## Known limits
@@ -140,15 +171,17 @@ tables are in [docs/PROTOCOL.md](docs/PROTOCOL.md).
 - Print history shows the raw status code reported by the printer; its meaning is not documented anywhere I found.
 - The first chunk of a Print waits for the whole cloud transfer (about two minutes for 5 MB), so Orca sits at 99% for a while.
 - Orca's plugin API is new and its printer-agent support is marked work in progress.
-- Windows only (DPAPI, WinHTTP and Winsock through `ctypes`).
 
 ## Repository layout
 
 ```
 assets/    icon (SVG, PNG, WebP, JPEG)
 docs/      protocol notes
-plugin/    the installable plugin
+plugin/    standalone Windows and Linux installers (same Python source)
 ```
+
+The two platform files contain the same source and use platform-suffixed filenames for Orca. After editing
+the Windows-named source, copy it over the Linux-named file and check that they match with `cmp`.
 
 ## License
 

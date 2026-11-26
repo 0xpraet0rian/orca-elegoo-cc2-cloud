@@ -7,7 +7,7 @@ Print from OrcaSlicer's own Print button, control the printer and watch its
 camera from OrcaSlicer 2.5.x, without ElegooSlicer and without LAN mode.
 
   Printer ........ Elegoo Centauri Carbon 2 (with or without Canvas)
-  Orca ........... 2.5.x, Windows
+  Orca ........... 2.5.x, Windows and Linux x86_64
   Needs .......... an Elegoo account, nothing to install (one Python file)
   Status ......... experimental, built and tested against one printer
 
@@ -22,7 +22,7 @@ camera from OrcaSlicer 2.5.x, without ElegooSlicer and without LAN mode.
     by filament type (PLA goes to a PLA slot).
 
   SEND G-CODE
-    A button in the plugin tab: pick a .gcode or .gcode.3mf with the Windows
+    A button in the plugin tab: pick a .gcode or .gcode.3mf with the native
     file dialog and upload it, without using Orca's Print button.
 
   CONTROL TAB
@@ -40,7 +40,7 @@ camera from OrcaSlicer 2.5.x, without ElegooSlicer and without LAN mode.
 
   OWN SIGN-IN
     You sign in with Elegoo's own page. The session is stored encrypted
-    (Windows DPAPI) and survives reinstalling the plugin.
+    (DPAPI on Windows, Secret Service or AES-GCM on Linux) and survives reinstalling the plugin.
 
   EXTRAS
     Three themes (Simple dark, Simple white, 0xpraet0rian), a Guide pop-up,
@@ -55,7 +55,8 @@ camera from OrcaSlicer 2.5.x, without ElegooSlicer and without LAN mode.
      turn on "Use printer agents instead of print hosts".
 
   2. Plugins > Install local plugin:
-     choose elegoo_cc2_cloud_win_x86_64.py and accept the permissions.
+     choose elegoo_cc2_cloud_win_x86_64.py on Windows or
+     elegoo_cc2_cloud_linux_x86_64.py on Linux and accept the permissions.
 
   3. In the printer preset (Printer settings > Basic information >
      Advanced) set Printer Agent to "Elegoo CC2 (cloud)".
@@ -98,7 +99,6 @@ camera from OrcaSlicer 2.5.x, without ElegooSlicer and without LAN mode.
     never starts it, so the plugin plays the printer on 127.0.0.1 and does the
     upload and the start itself.
   - LAN mode is not supported. Files of 500 MB or more are not supported.
-  - Windows only.
 
   If something fails, look at the Command console in the tab:
     "Another session"        ElegooSlicer or an old tab is still connected.
@@ -111,7 +111,7 @@ camera from OrcaSlicer 2.5.x, without ElegooSlicer and without LAN mode.
 
   - Your password passes through the plugin on its way to Elegoo's sign-in
     page. It is never stored or logged. Only the session Elegoo returns is
-    kept, encrypted with Windows DPAPI.
+    kept, using Windows DPAPI, Secret Service or local AES-GCM encryption.
   - The plugin listens on 127.0.0.1:47890 only. Requests with another Host
     header are refused.
   - Traffic goes to the Elegoo cloud and Agora (the cloud's messaging and

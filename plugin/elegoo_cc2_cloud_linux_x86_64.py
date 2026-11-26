@@ -1,0 +1,3258 @@
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["cryptography>=42; sys_platform == 'linux'"]
+#
+# [tool.orcaslicer.plugin]
+# name = "Elegoo CC2 Cloud"
+# description = "Send gcode to and control an Elegoo Centauri Carbon 2 from OrcaSlicer through the Elegoo cloud: upload, start/pause/stop, live status. Uses Elegoo browser sign-in, with optional ElegooSlicer session import on Windows."
+# author = "0xpraet0rian"
+# version = "0.6.0"
+# ///
+"""
+Elegoo Centauri Carbon 2 - cloud printer agent for OrcaSlicer 2.5.x
+
+License: PolyForm Noncommercial 1.0.0 (personal and other non-commercial use only; no selling, no commercial use).
+Copyright (c) 2026 0xpraet0rian, https://github.com/0xpraet0rian
+
+Architecture
+  * Python  : agent (discovery, connect, status mapping, upload, print), HTTP to matrix.elegoo.com
+  * JS page : the "Elegoo CC2" tab loads Agora Web RTM and is only a transport
+              (commands are published over RTM; the cloud has no other command path)
+  * Auth    : Elegoo browser sign-in and an encrypted local session.
+"""
+import base64
+import collections
+import hashlib
+import hmac
+import http.client
+import io
+import json
+import os
+from pathlib import Path
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.parse
+import uuid
+import zipfile
+
+import orca
+
+pa = orca.printer_agent
+
+BASE = "https://matrix.elegoo.com"
+AGENT_ID = "elegoo_cc2_cloud"
+AGORA_APP_ID = "d035320941e34cd5bc4ec106eff05580"  # public id from elegoo-link rtm_service.cpp
+IS_WINDOWS = sys.platform == "win32"
+IS_LINUX = sys.platform.startswith("linux")
+_HERE = Path(__file__).resolve().parent
+if IS_WINDOWS:
+    import ctypes
+    import ctypes.wintypes as wt
+
+    USER_INFO = Path(os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming") / "ElegooSlicer" / "user" / "user_info"
+    _DEFAULT_DATA = _HERE.parent.parent / "plugin_data" / AGENT_ID
+else:
+    _config = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+    if not _config.is_absolute():
+        _config = Path.home() / ".config"
+    _DEFAULT_DATA = _config / "OrcaSlicer" / "plugin_data" / AGENT_ID
+_DATA = Path(os.environ.get("CC2_DATA_DIR") or _DEFAULT_DATA)
+SESSION_FILE = _DATA / "cc2_session.dat"
+UA = "Mozilla/5.0"
+
+# update_fn stage numbers (Bambu-style guess: 1 upload, 3 sending, 5 wait printer, 6 finished, 7 error)
+ST_UPLOAD, ST_SEND, ST_WAIT, ST_DONE, ST_ERR = 1, 3, 5, 6, 7
+
+
+# --------------------------------------------------------------------------- helpers
+if IS_WINDOWS:
+    class _Blob(ctypes.Structure):
+        _fields_ = [("n", wt.DWORD), ("p", ctypes.POINTER(ctypes.c_char))]
+
+
+    def _dpapi(data: bytes) -> bytes:
+        i = _Blob(len(data), ctypes.cast(ctypes.create_string_buffer(data, len(data)), ctypes.POINTER(ctypes.c_char)))
+        o = _Blob()
+        if not ctypes.windll.crypt32.CryptUnprotectData(ctypes.byref(i), None, None, None, None, 0, ctypes.byref(o)):
+            raise OSError("DPAPI decrypt failed")
+        out = ctypes.string_at(o.p, o.n)
+        ctypes.windll.kernel32.LocalFree(o.p)
+        return out
+
+
+    def _protect(data: bytes) -> bytes:
+        i = _Blob(len(data), ctypes.cast(ctypes.create_string_buffer(data, len(data)), ctypes.POINTER(ctypes.c_char)))
+        o = _Blob()
+        if not ctypes.windll.crypt32.CryptProtectData(ctypes.byref(i), "cc2", None, None, None, 0, ctypes.byref(o)):
+            raise OSError("DPAPI encrypt failed")
+        out = ctypes.string_at(o.p, o.n)
+        ctypes.windll.kernel32.LocalFree(o.p)
+        return out
+
+
+    def _elegoo_user() -> dict:
+        return json.loads(_dpapi(_read_bytes(USER_INFO)).decode("utf-8"))
+
+
+    _wh = ctypes.WinDLL("winhttp", use_last_error=True)
+    _k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _vp = ctypes.c_void_p
+    _wh.WinHttpOpen.restype = _vp
+    _wh.WinHttpOpen.argtypes = [wt.LPCWSTR, wt.DWORD, wt.LPCWSTR, wt.LPCWSTR, wt.DWORD]
+    _wh.WinHttpConnect.restype = _vp
+    _wh.WinHttpConnect.argtypes = [_vp, wt.LPCWSTR, wt.WORD, wt.DWORD]
+    _wh.WinHttpOpenRequest.restype = _vp
+    _wh.WinHttpOpenRequest.argtypes = [_vp, wt.LPCWSTR, wt.LPCWSTR, wt.LPCWSTR, wt.LPCWSTR, _vp, wt.DWORD]
+    _wh.WinHttpSendRequest.argtypes = [_vp, wt.LPCWSTR, wt.DWORD, _vp, wt.DWORD, wt.DWORD, _vp]
+    _wh.WinHttpWriteData.argtypes = [_vp, _vp, wt.DWORD, ctypes.POINTER(wt.DWORD)]
+    _wh.WinHttpReceiveResponse.argtypes = [_vp, _vp]
+    _wh.WinHttpQueryHeaders.argtypes = [_vp, wt.DWORD, wt.LPCWSTR, _vp, ctypes.POINTER(wt.DWORD), _vp]
+    _wh.WinHttpReadData.argtypes = [_vp, _vp, wt.DWORD, ctypes.POINTER(wt.DWORD)]
+    _wh.WinHttpSetTimeouts.argtypes = [_vp, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+    _wh.WinHttpSetOption.argtypes = [_vp, wt.DWORD, _vp, wt.DWORD]
+    _wh.WinHttpCloseHandle.argtypes = [_vp]
+    _k32.CreateFileW.restype = _vp
+    _k32.CreateFileW.argtypes = [wt.LPCWSTR, wt.DWORD, wt.DWORD, _vp, wt.DWORD, wt.DWORD, _vp]
+    _k32.ReadFile.argtypes = [_vp, _vp, wt.DWORD, ctypes.POINTER(wt.DWORD), _vp]
+    _k32.GetFileSizeEx.argtypes = [_vp, ctypes.POINTER(ctypes.c_longlong)]
+    _k32.CloseHandle.argtypes = [_vp]
+
+
+    def _read_bytes(path):
+        h = _k32.CreateFileW(os.fspath(path), 0x80000000, 1 | 2, None, 3, 0x80, None)
+        if h in (None, ctypes.c_void_p(-1).value):
+            raise OSError("cannot open %s (error %d)" % (os.path.basename(path), ctypes.get_last_error()))
+        try:
+            size = ctypes.c_longlong()
+            _k32.GetFileSizeEx(h, ctypes.byref(size))
+            buf = (ctypes.c_char * size.value)()
+            got, done = wt.DWORD(), 0
+            while done < size.value:
+                n = min(1 << 24, size.value - done)
+                if not _k32.ReadFile(h, ctypes.byref(buf, done), n, ctypes.byref(got), None) or got.value == 0:
+                    raise OSError("read error")
+                done += got.value
+            return bytes(buf)
+        finally:
+            _k32.CloseHandle(h)
+
+
+    def _http_full(method, url, headers=None, data=None, timeout=30, user_agent=None):
+        """Returns (status, [(header, value)...], body). No redirects, no automatic cookies."""
+        u = urllib.parse.urlsplit(url)
+        secure = u.scheme == "https"
+        port = u.port or (443 if secure else 80)
+        path = (u.path or "/") + (("?" + u.query) if u.query else "")
+        h = {"User-Agent": user_agent or UA}
+        h.update(headers or {})
+        hdr = "".join("%s: %s\r\n" % (k, v) for k, v in h.items())
+        ses = _wh.WinHttpOpen("Mozilla/5.0", 4, None, None, 0) or _wh.WinHttpOpen("Mozilla/5.0", 0, None, None, 0)
+        if not ses:
+            raise OSError("WinHttpOpen failed")
+        con = req = None
+        try:
+            ms = int(timeout * 1000)
+            _wh.WinHttpSetTimeouts(ses, 15000, 15000, ms, ms)
+            con = _wh.WinHttpConnect(ses, u.hostname, port, 0)
+            req = _wh.WinHttpOpenRequest(con, method, path, None, None, None, 0x800000 if secure else 0)
+            if not (con and req):
+                raise OSError("WinHTTP request setup failed (%d)" % ctypes.get_last_error())
+            off = wt.DWORD(0x3)  # WINHTTP_DISABLE_COOKIES | WINHTTP_DISABLE_REDIRECTS (option 63)
+            if not _wh.WinHttpSetOption(req, 63, ctypes.byref(off), 4):
+                raise OSError("cannot disable redirects (%d)" % ctypes.get_last_error())
+            total = len(data) if data else 0
+            if not _wh.WinHttpSendRequest(req, hdr, 0xFFFFFFFF, None, 0, total, None):
+                raise OSError("WinHTTP send failed (%d)" % ctypes.get_last_error())
+            if total:
+                sent, w = 0, wt.DWORD()
+                mv = memoryview(data)
+                while sent < total:
+                    chunk = bytes(mv[sent:sent + (1 << 20)])
+                    if not _wh.WinHttpWriteData(req, chunk, len(chunk), ctypes.byref(w)):
+                        raise OSError("WinHTTP write failed (%d)" % ctypes.get_last_error())
+                    sent += w.value
+            if not _wh.WinHttpReceiveResponse(req, None):
+                raise OSError("WinHTTP receive failed (%d)" % ctypes.get_last_error())
+            code, sz = wt.DWORD(), wt.DWORD(4)
+            _wh.WinHttpQueryHeaders(req, 19 | 0x20000000, None, ctypes.byref(code), ctypes.byref(sz), None)
+            raw = ""
+            sz2 = wt.DWORD(0)
+            _wh.WinHttpQueryHeaders(req, 22, None, None, ctypes.byref(sz2), None)   # size probe (raw CRLF headers)
+            if sz2.value:
+                hb = ctypes.create_unicode_buffer(sz2.value // 2 + 2)
+                if _wh.WinHttpQueryHeaders(req, 22, None, hb, ctypes.byref(sz2), None):
+                    raw = hb.value
+            pairs = []
+            for ln in raw.split("\r\n")[1:]:
+                if ":" in ln:
+                    k, v = ln.split(":", 1)
+                    pairs.append((k.strip(), v.strip()))
+            out = []
+            buf = ctypes.create_string_buffer(65536)
+            while True:
+                rd = wt.DWORD()
+                if not _wh.WinHttpReadData(req, buf, 65536, ctypes.byref(rd)):
+                    raise OSError("WinHTTP read failed (%d)" % ctypes.get_last_error())
+                if rd.value == 0:
+                    break
+                out.append(buf.raw[:rd.value])
+            return code.value, pairs, b"".join(out)
+        finally:
+            for hnd in (req, con, ses):
+                if hnd:
+                    _wh.WinHttpCloseHandle(hnd)
+
+
+else:
+    def _read_bytes(path):
+        return Path(path).read_bytes()
+
+    def _http_full(method, url, headers=None, data=None, timeout=30, user_agent=None):
+        """Return status, raw header pairs and body, with no redirect or cookie handling."""
+        parts = urllib.parse.urlsplit(url)
+        connection_type = {"http": http.client.HTTPConnection, "https": http.client.HTTPSConnection}.get(parts.scheme)
+        if connection_type is None or not parts.hostname:
+            raise ValueError("Expected an HTTP(S) URL")
+        target = urllib.parse.urlunsplit(("", "", parts.path or "/", parts.query, ""))
+        request_headers = {"User-Agent": user_agent or UA}
+        request_headers.update(headers or {})
+        connection = connection_type(parts.hostname, parts.port, timeout=timeout)
+        try:
+            connection.request(method, target, body=data, headers=request_headers)
+            with connection.getresponse() as response:
+                return response.status, response.getheaders(), response.read()
+        finally:
+            connection.close()
+
+
+def _http(method, url, headers=None, data=None, timeout=30):
+    """Returns (status, body)."""
+    st, _h, body = _http_full(method, url, headers, data, timeout)
+    return st, body
+
+
+# --------------------------------------------------------------------------- local sign-in pass-through
+# The browser sign-in page uses a desktop message bridge. Keep the pass-through on loopback.
+if IS_WINDOWS:
+    _ws = ctypes.WinDLL("ws2_32", use_last_error=True)
+    _SOCK = ctypes.c_size_t
+    _INVALID_SOCK = _SOCK(-1).value
+
+
+    class _SockAddrIn(ctypes.Structure):
+        _fields_ = [("family", ctypes.c_short), ("port", ctypes.c_ushort),
+                    ("addr", ctypes.c_ubyte * 4), ("zero", ctypes.c_ubyte * 8)]
+
+
+    _ws.socket.restype = _SOCK
+    _ws.socket.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int]
+    _ws.bind.argtypes = [_SOCK, ctypes.c_void_p, ctypes.c_int]
+    _ws.listen.argtypes = [_SOCK, ctypes.c_int]
+    _ws.accept.restype = _SOCK
+    _ws.accept.argtypes = [_SOCK, ctypes.c_void_p, ctypes.c_void_p]
+    _ws.getsockname.argtypes = [_SOCK, ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
+    _ws.recv.restype = ctypes.c_int
+    _ws.recv.argtypes = [_SOCK, ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+    _ws.send.restype = ctypes.c_int
+    _ws.send.argtypes = [_SOCK, ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+    _ws.closesocket.argtypes = [_SOCK]
+    _ws.connect.restype = ctypes.c_int
+    _ws.connect.argtypes = [_SOCK, ctypes.c_void_p, ctypes.c_int]
+    _ws.shutdown.argtypes = [_SOCK, ctypes.c_int]
+    _ws.setsockopt.argtypes = [_SOCK, ctypes.c_int, ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
+    _WSA_READY = []
+
+
+    def _wsa():
+        if not _WSA_READY:
+            _ws.WSAStartup(0x0202, ctypes.create_string_buffer(512))
+            _WSA_READY.append(1)
+
+
+    def _pick_gcode():
+        """Windows 'Open' dialog for a .gcode / .gcode.3mf file; returns the path or ''."""
+        class OFN(ctypes.Structure):
+            _fields_ = [("lStructSize", wt.DWORD), ("hwndOwner", wt.HWND), ("hInstance", wt.HINSTANCE),
+                        ("lpstrFilter", wt.LPCWSTR), ("lpstrCustomFilter", wt.LPWSTR), ("nMaxCustFilter", wt.DWORD),
+                        ("nFilterIndex", wt.DWORD), ("lpstrFile", wt.LPWSTR), ("nMaxFile", wt.DWORD),
+                        ("lpstrFileTitle", wt.LPWSTR), ("nMaxFileTitle", wt.DWORD), ("lpstrInitialDir", wt.LPCWSTR),
+                        ("lpstrTitle", wt.LPCWSTR), ("Flags", wt.DWORD), ("nFileOffset", wt.WORD),
+                        ("nFileExtension", wt.WORD), ("lpstrDefExt", wt.LPCWSTR), ("lCustData", wt.LPARAM),
+                        ("lpfnHook", ctypes.c_void_p), ("lpTemplateName", wt.LPCWSTR), ("pvReserved", ctypes.c_void_p),
+                        ("dwReserved", wt.DWORD), ("FlagsEx", wt.DWORD)]
+        buf = ctypes.create_unicode_buffer(1024)
+        o = OFN()
+        o.lStructSize = ctypes.sizeof(OFN)
+        o.lpstrFilter = "G-code (*.gcode;*.3mf)\0*.gcode;*.3mf\0All files\0*.*\0\0"
+        o.lpstrFile, o.nMaxFile = ctypes.cast(buf, wt.LPWSTR), 1024
+        o.lpstrTitle = "Send G-code to the printer"
+        o.Flags = 0x00001000 | 0x00000800 | 0x00080000 | 0x00000008   # FILEMUSTEXIST | PATHMUSTEXIST | EXPLORER | NOCHANGEDIR
+        if not ctypes.windll.comdlg32.GetOpenFileNameW(ctypes.byref(o)):
+            return ""
+        return buf.value
+
+
+    def _open_url(url):
+        """Open a URL in the default browser without Python process APIs (not audited)."""
+        r = ctypes.windll.shell32.ShellExecuteW(None, "open", url, None, None, 1)
+        if r <= 32:
+            raise OSError("cannot open the browser (%d)" % r)
+
+
+else:
+    def _desktop_env():
+        """Keep AppImage runtime libraries and GTK modules out of host desktop tools."""
+        env = os.environ.copy()
+        appdir = env.get("APPDIR")
+        if not appdir:
+            return env
+        root = Path(appdir).resolve()
+        for name in ("LD_LIBRARY_PATH", "GIO_EXTRA_MODULES", "XDG_DATA_DIRS", "GSETTINGS_SCHEMA_DIR",
+                     "GDK_PIXBUF_MODULEDIR", "GDK_PIXBUF_MODULE_FILE"):
+            if name in env:
+                paths = [path for path in env[name].split(os.pathsep)
+                         if path and not Path(path).resolve().is_relative_to(root)]
+                if paths:
+                    env[name] = os.pathsep.join(paths)
+                else:
+                    env.pop(name)
+        return env
+
+    def _pick_gcode():
+        """Use a desktop-native dialog when available, including on Wayland."""
+        title = "Send G-code to the printer"
+        kde = "KDE" in os.environ.get("XDG_CURRENT_DESKTOP", "").upper().split(":")
+        dialogs = [
+            ("zenity", "--file-selection", "--title=" + title, "--file-filter=G-code | *.gcode *.3mf",
+             "--file-filter=All files | *"),
+            ("kdialog", "--title", title, "--getopenfilename", str(Path.home()), "*.gcode *.3mf|G-code"),
+        ]
+        for command in reversed(dialogs) if kde else dialogs:
+            if shutil.which(command[0]):
+                try:
+                    result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=_desktop_env())
+                except OSError:
+                    continue
+                if result.returncode == 0:
+                    return os.fsdecode(result.stdout.removesuffix(b"\n"))
+                if result.returncode == 1 and not result.stderr:
+                    return ""
+        # This call runs in the command worker, with its own Tk event loop.
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+
+            root = tk.Tk()
+            try:
+                root.withdraw()
+                return filedialog.askopenfilename(parent=root, title=title, filetypes=[
+                    ("G-code", ("*.gcode", "*.3mf")), ("All files", "*")])
+            finally:
+                root.destroy()
+        except (ImportError, RuntimeError) as error:
+            raise RuntimeError("Install Zenity or KDialog to select G-code files.") from error
+        except tk.TclError as error:
+            raise RuntimeError("No graphical file chooser is available. Check your display and install Zenity or KDialog.") from error
+
+    def _open_url(url):
+        opener = shutil.which("xdg-open")
+        if not opener:
+            raise OSError("Install xdg-utils to open your default browser.")
+        process = subprocess.Popen([opener, url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=_desktop_env())
+        try:
+            code = process.wait(timeout=0.3)
+        except subprocess.TimeoutExpired:
+            threading.Thread(target=process.wait, daemon=True, name="cc2-browser").start()
+        else:
+            if code:
+                raise OSError("xdg-open could not launch the browser (exit %d)." % code)
+
+
+class LoginProxy:
+    UPSTREAM = "https://account.elegoo.com"
+    DROP_RESP = {"transfer-encoding", "content-length", "connection", "content-security-policy",
+                 "content-security-policy-report-only", "x-frame-options", "strict-transport-security",
+                 "alt-svc", "report-to", "nel", "keep-alive", "cache-control", "etag", "last-modified"}
+    DROP_REQ = {"host", "origin", "referer", "connection", "content-length", "accept-encoding", "keep-alive",
+                "upgrade-insecure-requests", "transfer-encoding", "te", "proxy-connection",
+                "if-none-match", "if-modified-since"}
+
+    def __init__(self, on_msg, log):
+        self.on_msg, self.log = on_msg, log
+        self.sock = None
+        self.port = 0
+        self.nonce = uuid.uuid4().hex
+        self.stopped = False
+        self.connections = set()
+        self.connections_lock = threading.Lock()
+        self.lifecycle_lock = threading.Lock()
+
+    # ---- lifecycle
+    def _start_windows(self):
+        _wsa()
+        s = _ws.socket(2, 1, 6)
+        if s == _INVALID_SOCK:
+            raise OSError("socket failed (%d)" % ctypes.get_last_error())
+        sa = _SockAddrIn(2, 0, (ctypes.c_ubyte * 4)(127, 0, 0, 1))
+        if _ws.bind(s, ctypes.byref(sa), ctypes.sizeof(sa)) != 0 or _ws.listen(s, 32) != 0:
+            _ws.closesocket(s)
+            raise OSError("bind/listen failed (%d)" % ctypes.get_last_error())
+        n = ctypes.c_int(ctypes.sizeof(sa))
+        _ws.getsockname(s, ctypes.byref(sa), ctypes.byref(n))
+        self.port = ((sa.port & 0xFF) << 8) | (sa.port >> 8)
+        self.sock = s
+        self.thread = threading.Thread(target=self._accept_windows, daemon=True, name="cc2-proxy")
+        self.thread.start()
+        return self.port
+
+    def _stop_windows(self):
+        if self.stopped:
+            return
+        self.stopped = True
+        try:  # wake the blocking accept() with a throw-away loopback connection
+            w = _ws.socket(2, 1, 6)
+            sa = _SockAddrIn(2, ((self.port & 0xFF) << 8) | (self.port >> 8), (ctypes.c_ubyte * 4)(127, 0, 0, 1))
+            _ws.connect(w, ctypes.byref(sa), ctypes.sizeof(sa))
+            _ws.closesocket(w)
+        except Exception:
+            pass
+        self.thread.join(timeout=1)
+
+    def _accept_windows(self):
+        s = self.sock
+        try:
+            while not self.stopped:
+                c = _ws.accept(s, None, None)
+                if c == _INVALID_SOCK:
+                    break
+                if self.stopped:
+                    _ws.closesocket(c)
+                    break
+                threading.Thread(target=self._serve, args=(c,), daemon=True, name="cc2-proxy-conn").start()
+        finally:
+            self.sock = None
+            _ws.closesocket(s)
+
+    # ---- socket helpers
+    @staticmethod
+    def _recv(c, n=65536):
+        if not IS_WINDOWS:
+            return c.recv(n)
+        buf = ctypes.create_string_buffer(n)
+        got = _ws.recv(c, buf, n, 0)
+        return buf.raw[:got] if got > 0 else b""
+
+    @staticmethod
+    def _send_all(c, data):
+        if not IS_WINDOWS:
+            c.sendall(data)
+            return True
+        mv, off = memoryview(data), 0
+        while off < len(data):
+            chunk = bytes(mv[off:off + 65536])
+            n = _ws.send(c, chunk, len(chunk), 0)
+            if n <= 0:
+                return False
+            off += n
+        return True
+
+    def start(self):
+        if IS_WINDOWS:
+            return self._start_windows()
+        return self._start_linux(0)
+
+    def _start_linux(self, port):
+        with self.lifecycle_lock:
+            if self.sock is not None:
+                return self.port
+            return self._bind_linux(port)
+
+    def _bind_linux(self, port):
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            listener.bind(("127.0.0.1", port))
+            listener.listen(32)
+            listener.settimeout(0.2)
+            self.port = listener.getsockname()[1]
+            self.sock = listener
+            self.stopped = False
+            self.thread = threading.Thread(target=self._accept_linux, args=(listener,), daemon=True, name="cc2-loopback")
+            self.thread.start()
+            return self.port
+        except BaseException:
+            listener.close()
+            self.sock = None
+            raise
+
+    def stop(self):
+        if IS_WINDOWS:
+            self._stop_windows()
+        else:
+            with self.lifecycle_lock:
+                if self.sock is None:
+                    return
+                self.stopped = True
+                self.thread.join()
+                self.sock = None
+                with self.connections_lock:
+                    for client in self.connections:
+                        self._close_client(client)
+
+    def _accept_linux(self, listener):
+        with listener:
+            while not self.stopped:
+                try:
+                    client, _ = listener.accept()
+                except socket.timeout:
+                    continue
+                except OSError as error:
+                    self.log("loopback accept: %s" % error)
+                    break
+                with self.connections_lock:
+                    self.connections.add(client)
+                threading.Thread(target=self._serve, args=(client,), daemon=True, name="cc2-loopback-client").start()
+
+    def _client_timeout(self, client, seconds):
+        if IS_WINDOWS:
+            timeout = ctypes.c_int(seconds * 1000)
+            _ws.setsockopt(client, 0xFFFF, 0x1006, ctypes.byref(timeout), 4)
+        else:
+            client.settimeout(seconds)
+
+    def _close_client(self, client):
+        if IS_WINDOWS:
+            _ws.shutdown(client, 2)
+            _ws.closesocket(client)
+        else:
+            try:
+                client.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            client.close()
+
+    def _finish_client(self, client):
+        if IS_WINDOWS:
+            self._close_client(client)
+        else:
+            with self.connections_lock:
+                self.connections.discard(client)
+                self._close_client(client)
+
+    def _reply(self, c, status, body=b"", headers=None, reason="OK", head=False):
+        h = [("Content-Length", str(len(body))), ("Connection", "close"), ("Cache-Control", "no-store")]
+        h += list(headers or [])
+        out = ("HTTP/1.1 %d %s\r\n" % (status, reason) + "".join("%s: %s\r\n" % kv for kv in h) + "\r\n").encode("latin-1", "replace")
+        self._send_all(c, out + (b"" if head else body))
+
+    # ---- request handling
+    def _serve(self, c):
+        try:
+            self._client_timeout(c, 20)
+            data = b""
+            while b"\r\n\r\n" not in data and len(data) < 65536:
+                chunk = self._recv(c)
+                if not chunk:
+                    return
+                data += chunk
+            head, _, rest = data.partition(b"\r\n\r\n")
+            lines = head.decode("latin-1").split("\r\n")
+            try:
+                method, target, _ver = lines[0].split(" ", 2)
+            except ValueError:
+                return self._reply(c, 400, b"bad request", reason="Bad Request")
+            hdrs = {}
+            for ln in lines[1:]:
+                if ":" in ln:
+                    k, v = ln.split(":", 1)
+                    hdrs[k.strip().lower()] = v.strip()
+            if hdrs.get("host", "") != "127.0.0.1:%d" % self.port:       # DNS-rebinding protection
+                return self._reply(c, 403, b"forbidden", reason="Forbidden")
+            if hdrs.get("transfer-encoding"):
+                return self._reply(c, 411, b"length required", reason="Length Required")
+            need = int(hdrs.get("content-length", "0") or 0)
+            if not 0 <= need <= 4 * 1024 * 1024 or not target.startswith("/"):
+                return self._reply(c, 400, b"bad request", reason="Bad Request")
+            body = rest
+            while len(body) < need:
+                chunk = self._recv(c)
+                if not chunk:
+                    return
+                body += chunk
+            body = body[:need]
+            path = target.split("#", 1)[0]
+            if path.split("?", 1)[0] == "/__wx/" + self.nonce and method == "POST":
+                return self._wx(c, body)
+            self._proxy(c, method, path, hdrs, body)
+        except Exception as e:  # noqa
+            try:
+                self.log("proxy: %r" % e)
+                self._reply(c, 502, b"proxy error", reason="Bad Gateway")
+            except Exception:
+                pass
+        finally:
+            self._finish_client(c)
+
+    def _wx(self, c, body):
+        try:
+            m = json.loads(body.decode("utf-8"))
+            if isinstance(m, dict):
+                self.on_msg(m)
+        except Exception:
+            pass
+        self._reply(c, 200, b"{}", [("Content-Type", "application/json")])
+
+    SHIM = """<script>(function(){var N="__NONCE__";
+// The Elegoo page picks its desktop-client IPC from navigator.userAgent ("ElegooSlicer") and then talks to
+// window.nativeIpc; in a plain browser it stays in "browser mode" and never reports the session.
+try{var ua=navigator.userAgent+' ElegooSlicer/1.5.3';Object.defineProperty(navigator,'userAgent',{get:function(){return ua;},configurable:true});}catch(e){}
+var seq=0;
+function post(m){return fetch('/__wx/'+N,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(m)}).then(function(r){if(!r.ok)throw new Error('bridge '+r.status);return r;});}
+window.nativeIpc={
+ request:function(method,params,timeout){return post({id:'ni-'+(++seq),method:method,type:'request',params:params||{}}).then(function(){return {};});},
+ sendEvent:function(method,data){post({id:null,method:method,type:'event',params:data||{}}).catch(function(){});},
+ onRequest:function(){},on:function(){},off:function(){}};
+function rep(id,m,code,msg,data){setTimeout(function(){try{window.HandleStudio&&window.HandleStudio({id:id,method:m,type:'response',code:code,message:msg,data:data});}catch(e){}},0);}
+window.wx={postMessage:function(s){var m;try{m=JSON.parse(s);}catch(e){return;}
+ if(!m||m.type!=='request')return;
+ post(m).then(function(){rep(m.id,m.method,0,'success',{});}).catch(function(){rep(m.id,m.method,1,'failed',null);});}};
+})();</script>"""
+
+    def _proxy(self, c, method, path, hdrs, body):
+        origin = "http://127.0.0.1:%d" % self.port
+        fwd = {}
+        for k, v in hdrs.items():
+            if k in self.DROP_REQ or k.startswith("sec-fetch") or k.startswith("sec-ch"):
+                continue
+            fwd[k] = v
+        fwd["Accept-Encoding"] = "identity"
+        if "origin" in hdrs:
+            fwd["Origin"] = self.UPSTREAM
+        if "referer" in hdrs:
+            fwd["Referer"] = hdrs["referer"].replace(origin, self.UPSTREAM)
+        fwd.pop("user-agent", None)
+        status, rh, rb = _http_full(method, self.UPSTREAM + path, fwd, body or None, timeout=30,
+                                    user_agent=hdrs.get("user-agent") or UA)
+        ctype, out_h = "", []
+        for k, v in rh:
+            lk = k.lower()
+            if lk in self.DROP_RESP:
+                continue
+            if lk == "content-type":
+                ctype = v
+            if lk == "location":
+                v = v.replace(self.UPSTREAM, origin)
+            elif lk == "set-cookie":
+                parts = [p.strip() for p in v.split(";")]
+                parts = [p for p in parts if not p.lower().startswith(("domain=", "samesite=")) and p.lower() != "secure"]
+                v = "; ".join(parts + ["SameSite=Lax"])
+            out_h.append((k, v))
+        enc = any(k.lower() == "content-encoding" for k, _ in rh)
+        text = ("html" in ctype or "javascript" in ctype or "json" in ctype or "css" in ctype or "svg" in ctype) and not enc
+        if text:
+            s = rb.decode("utf-8", "replace").replace(self.UPSTREAM, origin)
+            if "html" in ctype:
+                shim = self.SHIM.replace("__NONCE__", self.nonce)
+                i = s.lower().find("<head>")
+                s = (s[:i + 6] + shim + s[i + 6:]) if i >= 0 else (shim + s)
+            rb = s.encode("utf-8")
+        reason = {200: "OK", 204: "No Content", 301: "Moved Permanently", 302: "Found", 304: "Not Modified",
+                  400: "Bad Request", 401: "Unauthorized", 403: "Forbidden", 404: "Not Found"}.get(status, "OK")
+        self._reply(c, status, rb, out_h, reason=reason, head=(method == "HEAD"))
+
+
+def _num(v, default=0.0):
+    try:
+        return float(v)
+    except Exception:
+        return default
+
+
+def _dict(v):
+    return v if isinstance(v, dict) else {}
+
+
+READ_ONLY = {1001, 1002, 1036, 1044, 2005}   # polling and reads are not shown in the console
+POKE = {1021, 1022, 1023, 1024, 1025, 1026, 1027, 1028, 1029, 1030, 1031, 2001, 2002, 2004, "start_file"}
+
+
+def _describe(method, p):
+    """(label, detail) of a command for the console."""
+    p = p if isinstance(p, dict) else {}
+    try:
+        if method == 1027:
+            return "Move", "%s %+g mm" % (str(p.get("axes", "")).upper(), float(p.get("distance", 0)))
+        if method == 1026:
+            return "Home", str(p.get("homed_axes", "")).upper()
+        if method == 1028:
+            if "extruder" in p:
+                return "Temperature", "nozzle target %s C" % p["extruder"]
+            if "heater_bed" in p:
+                return "Temperature", "bed target %s C" % p["heater_bed"]
+        if method == 1029:
+            return "Light", "on" if p.get("power") else "off"
+        if method == 1030:
+            names = {"fan": "model", "aux_fan": "assistance", "box_fan": "case"}
+            return "Fan", ", ".join("%s %d%%" % (names.get(k, k), round(float(v) * 100 / 255)) for k, v in p.items())
+        if method == 1031:
+            return "Print speed", {0: "Silent", 1: "Balanced", 2: "Sport", 3: "Ludicrous"}.get(p.get("mode"), str(p.get("mode")))
+        if method == 1020:
+            return "Start print", str(p.get("filename", ""))
+        if method in (1021, 1022, 1023):
+            return {1021: "Pause print", 1022: "Stop print", 1023: "Resume print"}[method], ""
+        if method in (1024, 1025):
+            return ("Feed" if method == 1024 else "Retract") + " filament", ""
+        if method in (2001, 2002):
+            return ("Load" if method == 2001 else "Unload") + " filament", "canvas %s, slot %d" % (p.get("canvas_id"), int(p.get("tray_id", 0)) + 1)
+        if method == 2004:
+            return "Auto refill", "on" if p.get("auto_refill") else "off"
+        if method == 1047:
+            return "Delete file", ", ".join(str(x) for x in (p.get("file_path") or []))
+        if method == 1057:
+            return "Send file to printer", str(p.get("filename", ""))
+        if method == 1058:
+            return "Cancel download", ""
+    except Exception:
+        pass
+    return "Command %s" % method, ""
+
+
+def _ms(v):
+    try:
+        v = float(v)
+    except Exception:
+        return 0
+    return int(v if v > 1e12 else v * 1000)
+
+
+def _atomic_write(path, data, *, create_only=False):
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    output = tempfile.NamedTemporaryFile(dir=path.parent, delete=False)
+    temp = Path(output.name)
+    try:
+        with output:
+            output.write(data)
+            output.flush()
+            os.fsync(output.fileno())
+        if create_only:
+            try:
+                os.link(temp, path)
+            except FileExistsError:
+                pass
+        else:
+            temp.replace(path)
+    finally:
+        temp.unlink(missing_ok=True)
+
+
+_KEYRING_MARKER = b"CC2:SecretService:v1"
+_AES_PREFIX = b"CC2:AESGCM:v1:"
+
+
+def _secret_tool(action, data=None):
+    """Communicate with Secret Service using stdin/stdout, with no token in argv."""
+    tool = shutil.which("secret-tool")
+    if not tool or not os.environ.get("DBUS_SESSION_BUS_ADDRESS"):
+        return None
+    command = [tool, action]
+    if action == "store":
+        command += ["--label", "OrcaSlicer Elegoo CC2 Cloud"]
+    profile = hashlib.sha256(os.fsencode(_DATA.resolve())).hexdigest()
+    command += ["application", AGENT_ID, "profile", profile]
+    try:
+        result = subprocess.run(command, input=data, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=8, env=_desktop_env())
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return result.stdout if result.returncode == 0 else None
+
+
+def _linux_key(*, create=False):
+    try:
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    except ImportError as error:
+        raise RuntimeError("Install the plugin's cryptography dependency to use encrypted local storage.") from error
+
+    machine_id = b""
+    for path in (Path("/etc/machine-id"), Path("/var/lib/dbus/machine-id")):
+        try:
+            machine_id = path.read_bytes().strip()
+        except FileNotFoundError:
+            continue
+        if machine_id:
+            break
+    if not machine_id:
+        raise RuntimeError("An initialized Linux machine-id is required for local session encryption.")
+    key_file = _DATA / "cc2_session.key"
+    if create and not key_file.exists():
+        _atomic_write(key_file, os.urandom(32), create_only=True)
+    # The machine ID and UID bind the key to this installation, but provide no secret entropy.
+    with os.fdopen(os.open(key_file, os.O_RDONLY | os.O_NOFOLLOW), "rb") as handle:
+        metadata = os.fstat(handle.fileno())
+        if metadata.st_uid != os.getuid() or metadata.st_mode & 0o077:
+            raise PermissionError("The CC2 session key must be owned by this user and have mode 0600.")
+        secret = handle.read(33)
+    if len(secret) != 32:
+        raise ValueError("Invalid CC2 session key.")
+    context = b"OrcaSlicer Elegoo CC2 session v1:" + machine_id + b":" + str(os.getuid()).encode("ascii")
+    return AESGCM(hmac.digest(secret, context, "sha256"))
+
+
+class Session:
+    """The plugin's own Elegoo login (never ElegooSlicer's refresh token)."""
+
+    def __init__(self):
+        self.d = None
+        self.lock = threading.RLock()
+
+    def get(self):
+        with self.lock:
+            if self.d is None:
+                if IS_WINDOWS:
+                    for path in (SESSION_FILE, _HERE / "cc2_session.dat"):
+                        try:
+                            self.d = json.loads(_dpapi(_read_bytes(path)))
+                            break
+                        except Exception:
+                            self.d = {}
+                else:
+                    try:
+                        data = _read_bytes(SESSION_FILE)
+                    except FileNotFoundError:
+                        self.d = {}
+                    else:
+                        if data == _KEYRING_MARKER:
+                            secret = _secret_tool("lookup")
+                            if secret is None:
+                                return {}  # retry once the keyring is unlocked
+                        elif data.startswith(_AES_PREFIX):
+                            payload = data[len(_AES_PREFIX):]
+                            try:
+                                secret = _linux_key().decrypt(payload[:12], payload[12:], _AES_PREFIX)
+                            except Exception as error:
+                                print("CC2: cannot read the encrypted session (%s)." % type(error).__name__, file=sys.stderr)
+                                return {}
+                        else:
+                            raise ValueError("Unrecognized CC2 session file.")
+                        self.d = json.loads(secret)
+            return dict(self.d)
+
+    def save(self, d):
+        with self.lock:
+            secret = json.dumps(d).encode("utf-8")
+            if IS_WINDOWS:
+                stored = _protect(secret)
+            elif d.get("token") and _secret_tool("store", secret) is not None:
+                stored = _KEYRING_MARKER
+            else:
+                nonce = os.urandom(12)
+                stored = _AES_PREFIX + nonce + _linux_key(create=True).encrypt(nonce, secret, _AES_PREFIX)
+            _atomic_write(SESSION_FILE, stored)
+            self.d = dict(d)
+
+    def update(self, **kw):
+        with self.lock:
+            d = self.get()
+            d.update(kw)
+            self.save(d)
+
+    def clear(self):
+        with self.lock:
+            if IS_WINDOWS:
+                (_HERE / "cc2_session.dat").unlink(missing_ok=True)
+            else:
+                _secret_tool("clear")
+            SESSION_FILE.unlink(missing_ok=True)
+            self.d = {}
+
+    def logged_in(self):
+        return bool(self.get().get("token"))
+
+
+SESSION = Session()
+
+PREFS_FILE = _DATA / "cc2_prefs.json"
+OPEN_OK = ("https://0xpraet0rian.github.io/", "https://github.com/0xpraet0rian")
+
+
+THEMES = ("simple-dark", "simple-light", "0x")
+
+
+def _prefs_get():
+    try:
+        d = json.loads(_read_bytes(PREFS_FILE).decode("utf-8"))
+    except Exception:
+        d = {}
+    return {"theme": d.get("theme") if d.get("theme") in THEMES else "simple-dark", "cam": d.get("cam") is not False, "autostart": d.get("autostart") is not False}
+
+
+def _prefs_set(theme=None, cam=None, autostart=None):
+    d = _prefs_get()
+    if theme in THEMES:
+        d["theme"] = theme
+    if cam is not None:
+        d["cam"] = bool(cam)
+    if autostart is not None:
+        d["autostart"] = bool(autostart)
+    _atomic_write(PREFS_FILE, json.dumps(d).encode("utf-8"))
+    return d
+
+
+def _refresh_session():
+    d = SESSION.get()
+    rt = d.get("refreshToken")
+    if not rt:
+        raise RuntimeError("Session expired: sign in again in the Elegoo CC2 tab.")
+    status, body = _http("POST", BASE + "/api/v1/account-center-server/account-auth/token/refresh",
+                         {"Authorization": "Bearer " + d.get("token", ""), "Content-Type": "application/json"},
+                         data=json.dumps({"refreshToken": rt, "clientId": "Slicer"}).encode())
+    j = json.loads(body) if status == 200 else {}
+    if j.get("code") not in (0, 200) or not isinstance(j.get("data"), dict):
+        SESSION.update(token="", refreshToken="")
+        raise RuntimeError("Session expired: sign in again in the Elegoo CC2 tab.")
+    x = j["data"]
+    SESSION.update(token=x.get("accessToken") or x.get("token") or d.get("token"),
+                   refreshToken=x.get("refreshToken") or rt,
+                   exp=_ms(x.get("expiresTime") or x.get("accessTokenExpireTime")))
+
+
+def _token():
+    d = SESSION.get()
+    if not d.get("token"):
+        raise RuntimeError("Not signed in: use Sign in in the Elegoo CC2 tab.")
+    exp = d.get("exp") or 0
+    if exp and exp - time.time() * 1000 < 120000 and d.get("refreshToken"):
+        try:
+            _refresh_session()
+        except Exception as e:
+            HUB.log("token refresh: %s" % e)
+    return SESSION.get().get("token", "")
+
+
+def _api(path, params=None, method="GET"):
+    tok = _token()
+    url = BASE + path + (("?" + urllib.parse.urlencode(params)) if params else "")
+    status, body = _http(method, url, {"Authorization": "Bearer " + tok})
+    if status in (401, 403):
+        raise RuntimeError("Elegoo cloud HTTP %s (session expired? sign in again in the Elegoo CC2 tab)" % status)
+    if status != 200:
+        raise RuntimeError("Elegoo cloud HTTP %s" % status)
+    j = json.loads(body)
+    if j.get("code") in (401, 30010, 30012):
+        SESSION.update(token="", refreshToken="")
+        HUB._push_account()
+        raise RuntimeError("Your Elegoo session is no longer valid (password changed or signed out elsewhere): "
+                           "sign in again in the Elegoo CC2 tab.")
+    if j.get("code") != 0:
+        raise RuntimeError("Elegoo cloud error %s %s" % (j.get("code"), j.get("msg")))
+    return j.get("data")
+
+
+# --------------------------------------------------------------------------- hub (shared state)
+class Hub:
+    """Singleton shared by the page capability and the agent capability."""
+
+    def __init__(self):
+        self.page = None
+        self.page_ready = False
+        self.rtm_online = False
+        self.gen = 0                # RTM session generation (stale events are ignored)
+        self.login_event = threading.Event()
+        self.login_error = ""
+        self.login_lock = threading.Lock()
+        self.login_fail_until = 0.0
+        self.was_connected = False
+        self.lock = threading.Lock()
+        self.pending = {}           # id -> [Event, result]
+        self.seq = 1000
+        self.status = {}            # merged printer status (method 1002/6000)
+        self.attrs = {}
+        self.downloads = {}         # taskID -> latest 6006 result
+        self.logs = collections.deque(maxlen=300)
+        self.creds = None
+        self.sn = ""
+        self.user_id = ""
+        self.dev_name = "Centauri Carbon 2"
+        self.queue_main = None
+        self.cb = {}
+        self.poll_stop = threading.Event()
+        self.poll_thread = None
+        self.ui_thread = None
+        self.outbox = collections.deque()          # critical items: never evicted
+        self.outlogs = collections.deque(maxlen=120)
+        self.out_status = None                      # only the latest status matters
+        self.printer_online = True
+        self.devices = []
+        self.login_proxy = None
+        self.login_timer = None
+        self.connect_lock = threading.Lock()
+        self.samples = collections.deque(maxlen=1800)     # [t_ms, nozzle, nozzle_t, bed, bed_t, chamber, model%, aux%, case%]
+        self.cmdlog = collections.deque(maxlen=400)       # commands sent to the printer (console)
+        self.cmd_id = 0
+        self.s_cursor = 0
+        self.c_cursor = 0
+        self.data_lock = threading.Lock()
+        self.tl = threading.local()                       # .src = "orca" for commands issued by Orca's own flows
+        self.rtc = None
+        self.cur_code = None
+        self.status_ts = 0.0
+        self.busy = threading.Lock()
+        self.want_poll = False
+        self.poll_lock = threading.Lock()
+        self.cur_gs = "IDLE"
+
+    # ---- logging (never log tokens or signed URLs)
+    def log(self, msg):
+        line = time.strftime("%H:%M:%S ") + str(msg)
+        self.logs.append(line)
+        self._post({"type": "log", "line": line})
+
+    # ---- ui bridge: only the UI thread talks to the webview; other threads use an outbox
+    # that the page drains by polling ({"type":"pull"} every few hundred ms).
+    def _post(self, obj):
+        page = self.page
+        if page is None or not self.page_ready:
+            return False
+        if threading.get_ident() == self.ui_thread:
+            try:
+                page.post_message(obj)
+            except Exception as e:  # noqa
+                self.logs.append("post_message failed: %r" % e)
+            return True
+        t = obj.get("type")
+        if t == "status":
+            self.out_status = obj
+        elif t == "log":
+            self.outlogs.append(obj)
+        else:
+            self.outbox.append(obj)
+        return True
+
+    def _drain(self):
+        items = []
+        while self.outbox:
+            try:
+                items.append(self.outbox.popleft())
+            except IndexError:
+                break
+        while self.outlogs:
+            try:
+                items.append(self.outlogs.popleft())
+            except IndexError:
+                break
+        if self.out_status is not None:
+            items.append(self.out_status)
+            self.out_status = None
+        with self.data_lock:
+            new_s = [x for x in self.samples if x[0] > self.s_cursor]
+            new_c = [e for e in self.cmdlog if e["id"] > self.c_cursor]
+        if new_s:
+            items.append({"type": "samples", "items": new_s})
+            self.s_cursor = new_s[-1][0]
+        if new_c:
+            items.append({"type": "cmdlog", "items": new_c})
+            self.c_cursor = new_c[-1]["id"]
+        if items and self.page is not None:
+            try:
+                self.page.post_message({"type": "batch", "items": items})
+            except Exception as e:  # noqa
+                self.logs.append("post_message failed: %r" % e)
+
+    def _drop_publish(self, rid):
+        keep = [x for x in list(self.outbox) if not (x.get("type") == "publish" and x.get("id") == rid)]
+        self.outbox.clear()
+        self.outbox.extend(keep)
+
+    # ---- events from the JS page (UI thread; keep it quick)
+    def on_page_message(self, data):
+        self.ui_thread = threading.get_ident()
+        try:
+            if isinstance(data, str):
+                data = json.loads(data)
+            t = data.get("type")
+            g = data.get("gen")
+            stale = g is not None and g != self.gen
+            if t == "pull":
+                self._drain()
+            elif t == "ready":
+                self.s_cursor = 0
+                self.c_cursor = 0
+                self.outbox.clear()
+                self.outlogs.clear()
+                self.out_status = None
+                self.page_ready = True
+                self.rtm_online = False
+                self.log("RTM page ready")
+                self._post({"type": "logs", "lines": list(self.logs)[-100:]})
+                self._post(dict(_prefs_get(), type="prefs"))
+                self._push_account()
+                threading.Thread(target=self._auto_connect, daemon=True, name="cc2-autoconnect").start()
+            elif t == "login_ok" and not stale:
+                self.rtm_online = True
+                self.login_error = ""
+                self.login_event.set()
+                self.log("RTM login ok")
+                if self.was_connected:
+                    self._fire_local_connect(0, "")
+                threading.Thread(target=self._after_login, daemon=True).start()
+            elif t == "login_err" and not stale:
+                self.rtm_online = False
+                self.login_error = str(data.get("error"))
+                self.login_event.set()
+                self.log("RTM login error: %s" % self.login_error)
+                if "-10027" in self.login_error:
+                    self._post({"type": "note", "kind": "bad", "text":
+                                "Another Elegoo session is using this account (ElegooSlicer?). Close it, then press Connect."})
+            elif t == "rtm_status" and not stale:
+                st = str(data.get("state"))
+                self.log("RTM state: %s (%s)" % (st, data.get("reason")))
+                if st.upper() in ("DISCONNECTED", "FAILED"):
+                    self.rtm_online = False
+                    self._fire_local_connect(2, "RTM %s" % data.get("reason"))
+            elif t == "publish_err":
+                err = str(data.get("error"))
+                if "-11033" in err:  # the printer (target user) is offline in the cloud; RTM itself is fine
+                    self._set_printer_online(False, "The printer is offline in the Elegoo cloud (powered off or no Wi-Fi?)")
+                else:
+                    self.rtm_online = False
+                self._fail_pending(data.get("id"), err)
+            elif t == "cmd":
+                threading.Thread(target=self._ui_cmd, args=(data,), daemon=True, name="cc2-ui-cmd").start()
+            elif t == "token_expiring" and not stale:
+                threading.Thread(target=self._renew, daemon=True).start()
+            elif t == "msg":
+                self._on_rtm_text(data.get("text", ""))
+            elif t == "click_login":
+                threading.Thread(target=self._safe_login, daemon=True).start()
+        except Exception as e:
+            self.log("on_page_message error: %r" % e)
+
+    def _after_login(self):
+        try:
+            r = self.request(1001, {}, timeout=15)
+            self.attrs = r
+            self._post({"type": "info", "name": r.get("hostname") or self.dev_name,
+                        "model": r.get("machine_model", ""), "ip": r.get("ip", ""), "sn": self.sn,
+                        "fw": _dict(r.get("software_version")).get("ota_version", "")})
+            if self.want_poll and not (self.poll_thread and self.poll_thread.is_alive() and not self.poll_stop.is_set()):
+                self.start_poll()
+        except Exception as e:
+            self.log("after login: %s" % e)
+
+    def _safe_login(self):
+        try:
+            self.login_fail_until = 0.0
+            self.want_poll = True
+            self.ensure_login()
+            if not (self.poll_thread and self.poll_thread.is_alive() and not self.poll_stop.is_set()):
+                self.start_poll()
+        except Exception as e:
+            self.log("login: %s" % e)
+
+    def is_idle(self):
+        return self.cur_code == 1 and time.time() - self.status_ts < 20
+
+    def _set_printer_online(self, on, msg=None):
+        if not on:
+            self.cur_code = None
+        if self.printer_online != on:
+            self.printer_online = on
+            self._post({"type": "conn", "printer": on, "msg": msg})
+
+    # ---- commands from the tab (parameters validated; shapes copied from ElegooSlicer's own Device page)
+    def _ui_cmd(self, data):
+        rid, m, p = data.get("rid"), data.get("method"), _dict(data.get("params"))
+        try:
+            res = self._exec_ui(m, p)
+            self._post({"type": "cmd_result", "rid": rid, "ok": True, "result": res})
+        except Exception as e:
+            self.log("ui cmd %s: %s" % (m, e))
+            self._post({"type": "cmd_result", "rid": rid, "ok": False, "error": str(e)})
+
+    @staticmethod
+    def _int(v, lo, hi, name):
+        try:
+            n = int(round(float(v)))
+        except Exception:
+            raise ValueError("%s must be a number" % name)
+        if not lo <= n <= hi:
+            raise ValueError("%s must be %d-%d" % (name, lo, hi))
+        return n
+
+    @staticmethod
+    def _valid_name(n):
+        n = str(n)
+        if not n.lower().endswith(".gcode") or len(n) > 200 or ".." in n or "/" in n or "\\" in n:
+            raise ValueError("bad file name")
+        if any(ord(c) < 32 for c in n):
+            raise ValueError("bad file name")
+        return n
+
+    def _exec_ui(self, m, p):
+        res = self._exec_ui_locked(m, p)
+        mm = int(m) if str(m).isdigit() else m
+        if mm in POKE:
+            self._poke_status()
+        return res
+
+    def _exec_ui_locked(self, m, p):
+        long_ops = (1024, 1025, 1026, 2001, 2002, "start_file")
+        mm = int(m) if str(m).isdigit() else m
+        if mm in long_ops:
+            if not self.busy.acquire(blocking=False):
+                raise RuntimeError("another operation is still running")
+            try:
+                return self._exec_ui2(m, p)
+            finally:
+                self.busy.release()
+        return self._exec_ui2(m, p)
+
+    def _exec_ui2(self, m, p):
+        idle = self.is_idle()
+        if m == "acct_status":
+            if SESSION.logged_in() and not self.devices:
+                try:
+                    self.fetch_creds()
+                except Exception as e:
+                    self.log("device list: %s" % e)
+            return self.account_state()
+        if m == "cam_creds":
+            self.fetch_creds()
+            if not (self.rtc and self.rtc.get("token") and self.rtc.get("uid") is not None):
+                raise RuntimeError("no camera credentials for this printer")
+            return dict(self.rtc)
+        if m == "acct_login":
+            self.start_browser_login()
+            return {"started": True}
+        if m == "acct_import":
+            self.import_from_elegooslicer()
+            return self.account_state()
+        if m == "acct_logout":
+            self.sign_out()
+            return self.account_state()
+        if m == "acct_select":
+            sn = str(p.get("sn", ""))
+            if sn not in [x["sn"] for x in self.devices]:
+                raise ValueError("unknown printer")
+            SESSION.update(sn=sn)
+            self.want_poll = False
+            self.stop_poll()
+            self.logout()
+            self.status, self.sn = {}, sn
+            self._push_account()
+            return self.account_state()
+        if m == "acct_connect":
+            self.connect_cloud()
+            return self.account_state()
+        if m == "acct_auto":
+            SESSION.update(auto=bool(p.get("on")))
+            return self.account_state()
+        if m == "files":
+            try:
+                return {"files": self._files_http(), "source": "cloud"}
+            except Exception as e:
+                self.log("file list over HTTP failed (%s); asking the printer in small pages" % e)
+            files, page = [], 1
+            while page <= 30:
+                r = self.request(1044, {"storage_media": "local", "path": "/", "page": page, "page_size": 8}, timeout=15)
+                lst = r.get("file_list") or []
+                for f in lst:
+                    if isinstance(f, dict) and f.get("type", "file") == "file":
+                        files.append({k: f.get(k) for k in ("filename", "size", "layer", "print_time",
+                                                            "total_filament_used", "color_map", "create_time")})
+                if len(lst) < 8:
+                    break
+                page += 1
+            return {"files": files, "source": "printer"}
+        if m == "prefs_get":
+            return _prefs_get()
+        if m == "prefs_set":
+            return _prefs_set(p.get("theme"), p.get("cam"), p.get("autostart"))
+        if m == "open_url":
+            url = str(p.get("url", ""))
+            if url not in OPEN_OK:
+                raise ValueError("link not allowed")
+            _open_url(url)
+            return {}
+        if m == "history_delete":
+            ids = [str(x) for x in (p.get("ids") or [])]
+            import re as _re
+            if not ids or any(not _re.fullmatch(r"[0-9A-Za-z_\-]{1,40}", x) for x in ids):
+                raise ValueError("bad id")
+            _api("/api/v1/device-management-server/device-data/event-data",
+                 {"ids": ",".join(ids), "deviceCode": self.sn or SESSION.get().get("sn", "")}, method="DELETE")
+            return {}
+        if m == "canvas":
+            return self.request(2005, {}, timeout=15)
+        if m == "history":
+            return self._history_http(int(_num(p.get("page"), 1)), int(_num(p.get("size"), 10)))
+        if m == "send_local":
+            path = _pick_gcode()
+            if not path:
+                return {"cancelled": True}
+            import types
+            base = os.path.basename(path)
+            for suf in (".gcode.3mf", ".3mf"):
+                if base.lower().endswith(suf):
+                    base = base[:-len(suf)] + ".gcode"
+                    break
+            pp = types.SimpleNamespace(filename=path, dst_file=base, project_name=os.path.splitext(base)[0], plate_index=1)
+            self.tl.src = "tab"
+            name = _send_to_printer(pp, lambda st, pct, msg: self.log("send: %s %s%%" % (msg, pct)), None)
+            return {"name": name}
+        if m == "samples_clear":
+            with self.data_lock:
+                self.samples.clear()
+            self.s_cursor = 0
+            return {}
+        if m == "cmdlog_clear":
+            with self.data_lock:
+                self.cmdlog.clear()
+            return {}
+        if m == "start_file":
+            if not idle:
+                raise RuntimeError("the printer is not idle")
+            name = self._valid_name(p.get("filename", ""))
+            slots = []
+            for x in p.get("slots") or []:
+                slots.append({"t": self._int(x.get("t"), 0, 15, "t"), "canvas_id": self._int(x.get("canvas_id"), 0, 3, "canvas"),
+                              "tray_id": self._int(x.get("tray_id"), 0, 3, "slot")})
+            cfg = {"delay_video": False, "printer_check": bool(p.get("leveling")), "print_layout": "A",
+                   "bedlevel_force": False, "slot_map": slots}
+            return self.request(1020, {"filename": name, "storage_media": "local", "config": cfg}, timeout=30)
+        m = int(m) if str(m).isdigit() else m
+        if m in (1021, 1022, 1023, 1024, 1025, 1036):
+            if m in (1024, 1025) and not idle:
+                raise RuntimeError("the printer is not idle")
+            return self.request(m, {}, timeout=300 if m in (1024, 1025) else 30)
+        if m == 1026:
+            ax = "".join(sorted(set(str(p.get("homed_axes", "")).lower()) & set("xyz")))
+            if not ax or not idle:
+                raise RuntimeError("homing needs an idle printer and axes x/y/z")
+            return self.request(1026, {"homed_axes": ax}, timeout=90)
+        if m == 1027:
+            ax = str(p.get("axes", "")).lower()
+            if ax not in ("x", "y", "z") or not idle:
+                raise RuntimeError("moving needs an idle printer and one axis")
+            th = _dict(self.status.get("tool_head")) or _dict(self.status.get("toolhead"))
+            if ax not in str(th.get("homed_axes", "") or ""):
+                raise RuntimeError("home the %s axis before moving it" % ax.upper())
+            dist = float(p.get("distance", 0))
+            if not (0 < abs(dist) <= 100):
+                raise ValueError("distance must be up to 100 mm")
+            return self.request(1027, {"axes": ax, "distance": dist}, timeout=30)
+        if m == 1028:
+            if "extruder" in p:
+                return self.request(1028, {"extruder": self._int(p["extruder"], 0, 350, "nozzle")}, timeout=20)
+            if "heater_bed" in p:
+                return self.request(1028, {"heater_bed": self._int(p["heater_bed"], 0, 120, "bed")}, timeout=20)
+            raise ValueError("nothing to set")
+        if m == 1029:
+            return self.request(1029, {"power": 1 if int(p.get("power", 0)) else 0}, timeout=15)
+        if m == 1030:
+            out = {k: self._int(p[k], 0, 255, k) for k in ("fan", "box_fan", "aux_fan") if k in p}
+            if not out:
+                raise ValueError("nothing to set")
+            return self.request(1030, out, timeout=15)
+        if m == 1031:
+            return self.request(1031, {"mode": self._int(p.get("mode"), 0, 3, "mode")}, timeout=15)
+        if m in (2001, 2002):
+            if not idle:
+                raise RuntimeError("the printer is not idle")
+            return self.request(m, {"canvas_id": self._int(p.get("canvas_id"), 0, 3, "canvas"),
+                                    "tray_id": self._int(p.get("tray_id"), 0, 3, "slot")}, timeout=300)
+        if m == 2004:
+            return self.request(2004, {"auto_refill": bool(p.get("auto_refill"))}, timeout=15)
+        if m == 1047:
+            names = [self._valid_name(x) for x in (p.get("file_path") or [])]
+            if not names:
+                raise ValueError("bad file name")
+            cur = str(_dict(self.status.get("print_status")).get("filename", ""))
+            if cur in names and not idle:
+                raise RuntimeError("that file is being printed")
+            return self.request(1047, {"storage_media": "local", "file_path": names}, timeout=30)
+        raise ValueError("command not allowed: %s" % m)
+
+    # ---- account (own login session)
+    def account_state(self):
+        d = SESSION.get()
+        return {"logged": bool(d.get("token")), "email": d.get("email", ""), "nickname": d.get("nickname", ""),
+                "source": d.get("source", ""), "sn": d.get("sn", "") or self.sn, "devices": self.devices,
+                "rtm": self.rtm_online, "printer": self.printer_online, "auto": d.get("auto", True)}
+
+    def _push_account(self):
+        self._post(dict(self.account_state(), type="account"))
+
+    def start_browser_login(self):
+        d = SESSION.get()
+        dev_id = d.get("deviceId") or uuid.uuid4().hex
+        self._stop_login_proxy()
+        px = LoginProxy(lambda data: self._on_login_msg(data, dev_id, px), self.log)
+        port = px.start()
+        self.login_proxy = px
+        url = "http://127.0.0.1:%d/account/slicer-login?region=global&theme=light&deviceId=%s" % (port, dev_id)
+        try:
+            _open_url(url)
+        except Exception:
+            self._stop_login_proxy()
+            raise
+        self.log("sign-in page opened in your browser (local pass-through on 127.0.0.1:%d)" % port)
+        self.login_timer = threading.Timer(900, px.stop)
+        self.login_timer.daemon = True
+        self.login_timer.start()
+
+    def _stop_login_proxy(self):
+        timer, self.login_timer = self.login_timer, None
+        if timer:
+            timer.cancel()
+        px, self.login_proxy = self.login_proxy, None
+        if px:
+            px.stop()
+
+    def _on_login_msg(self, data, device_id, proxy):
+        """Messages from the Elegoo sign-in page (same bridge ElegooSlicer uses). Only method names are logged."""
+        try:
+            if isinstance(data, str):
+                data = json.loads(data)
+            m = data.get("method") if isinstance(data, dict) else None
+            self.log("sign-in page message: %s" % (m or type(data).__name__))
+            if m == "report.userInfo":
+                self.log("sign-in page reported user info; fields: %s" % sorted(_dict(data.get("params")).keys()))
+                threading.Thread(target=self._store_login, args=(_dict(data.get("params")), device_id, proxy), daemon=True).start()
+            elif m == "report.websiteOpen":
+                url = str(_dict(data.get("params")).get("url", ""))
+                if url.startswith("https://"):
+                    threading.Thread(target=lambda: _open_url(url), daemon=True).start()
+        except Exception as e:
+            self.log("sign-in message error: %r" % e)
+
+    def _store_login(self, u, device_id, proxy):
+        if proxy is not self.login_proxy or proxy.stopped:
+            return
+        try:
+            tok = u.get("accessToken") or u.get("token")
+            if not tok:
+                raise RuntimeError("sign-in page sent no token")
+            keep = SESSION.get()
+            SESSION.save({"token": tok, "refreshToken": u.get("refreshToken", ""), "exp": _ms(u.get("expiresTime")),
+                          "userId": str(u.get("userId", "")), "email": u.get("email", ""),
+                          "nickname": u.get("nickname", ""), "deviceId": device_id,
+                          "source": "own", "sn": keep.get("sn", "")})
+            self.log("signed in")
+            if proxy:
+                t = threading.Timer(5, proxy.stop)
+                t.daemon = True
+                t.start()
+            try:
+                self.fetch_creds()
+            except Exception as e:
+                self.log("device list: %s" % e)
+            self._push_account()
+            self._post({"type": "note", "kind": "ok", "text": "Signed in."})
+            self._auto_connect()
+        except Exception as e:
+            self.log("store login: %s" % e)
+            self._post({"type": "note", "kind": "bad", "text": "Could not save the Elegoo session: " + str(e)})
+
+    def import_from_elegooslicer(self):
+        if not IS_WINDOWS:
+            raise RuntimeError("Use Sign in with Elegoo on Linux.")
+        u = _elegoo_user()
+        if not u.get("token"):
+            raise RuntimeError("ElegooSlicer has no active login")
+        keep = SESSION.get()
+        # token only: the refresh token stays with ElegooSlicer so its session is never rotated from here
+        SESSION.save({"token": u["token"], "refreshToken": "", "exp": _ms(u.get("accessTokenExpireTime")),
+                      "userId": str(u.get("userId", "")), "email": u.get("email", ""),
+                      "nickname": u.get("nickname", ""), "deviceId": keep.get("deviceId", ""),
+                      "source": "imported", "sn": keep.get("sn", "")})
+        self.fetch_creds()
+        self._push_account()
+
+    def sign_out(self):
+        self._stop_login_proxy()
+        self.want_poll = False
+        self.stop_poll()
+        self.was_connected = False
+        self.logout()
+        try:
+            if SESSION.get().get("source") == "own":
+                _http("POST", BASE + "/api/v1/account-center-server/account-auth/logout",
+                      {"Authorization": "Bearer " + SESSION.get().get("token", ""),
+                       "Content-Type": "application/json"}, data=b"{}", timeout=5)
+        except Exception:
+            pass
+        SESSION.clear()
+        self.devices, self.creds, self.sn, self.status = [], None, "", {}
+        self._push_account()
+
+    # ---- connect to the cloud (tab button, auto-connect after sign-in / tab open)
+    def _connstat(self, text, kind=""):
+        self.log(text)
+        self._post({"type": "connstat", "text": text, "kind": kind})
+
+    def connect_cloud(self):
+        if not self.connect_lock.acquire(blocking=False):
+            return
+        try:
+            self.login_fail_until = 0.0
+            self.want_poll = True
+            self._connstat("Connecting to the Elegoo cloud...")
+            self.ensure_login()
+            self._connstat("Cloud link is up; asking the printer...")
+            self.request(1001, {}, timeout=15)
+            self.was_connected = True
+            self._after_login()
+            self._connstat("Connected", "ok")
+            self._push_account()
+        except Exception as e:
+            self._connstat("Not connected: %s" % e, "bad")
+            raise
+        finally:
+            self.connect_lock.release()
+
+    def _auto_connect(self):
+        try:
+            if SESSION.logged_in() and SESSION.get().get("auto", True) and not self.rtm_online:
+                self.connect_cloud()
+        except Exception:
+            pass
+
+    # ---- cloud-side lists (no RTM message size limit; the same API ElegooSlicer uses)
+    @staticmethod
+    def _norm_file(f):
+        cm = []
+        try:
+            raw = f.get("colorMap")
+            arr = json.loads(raw) if isinstance(raw, str) and raw else (raw or [])
+            for e in arr if isinstance(arr, list) else []:
+                t = e.get("t")
+                cm.append({"t": int(t) if isinstance(t, (int, float)) and t >= 0 else 0,
+                           "color": str(e.get("color", "")), "name": str(e.get("type", ""))})
+        except Exception:
+            cm = []
+        return {"filename": f.get("filename") or f.get("fileName") or "", "size": f.get("size"), "layer": f.get("layer"),
+                "print_time": f.get("printTime"), "total_filament_used": f.get("totalFilamentUsed"),
+                "color_map": cm, "create_time": f.get("createTime")}
+
+    def _files_http(self):
+        sn = self.sn or SESSION.get().get("sn", "")
+        out, page, total = [], 1, None
+        while page <= 40:
+            d = _dict(_api("/api/v1/device-management-server/local-file/page",
+                           {"serialNo": sn, "pageNo": page, "pageSize": 50}))
+            lst = d.get("list") or []
+            out += [self._norm_file(f) for f in lst if isinstance(f, dict)]
+            total = d.get("total", total)
+            if len(lst) < 50 or (total is not None and len(out) >= int(_num(total))):
+                break
+            page += 1
+        return [f for f in out if f["filename"]]
+
+    def _history_http(self, page=1, size=10):
+        sn = self.sn or SESSION.get().get("sn", "")
+        page, size = max(1, page), min(100, max(5, size))
+        d = _dict(_api("/api/v1/device-management-server/device/event-data/page",
+                       {"deviceCode": sn, "pageNo": page, "pageSize": size, "eventKey": "history_task",
+                        "sort": "create_time,desc"}))
+        tasks = []
+        for it in d.get("list") or []:
+            if not isinstance(it, dict):
+                continue
+            ev = it.get("eventValue")
+            try:
+                ev = json.loads(ev) if isinstance(ev, str) else _dict(ev)
+            except Exception:
+                ev = {}
+            tasks.append({"id": str(it.get("id", "")), "name": str(ev.get("task_name", "") or ""),
+                          "begin": ev.get("begin_time"), "end": ev.get("end_time"), "status": ev.get("task_status")})
+        return {"tasks": tasks, "total": d.get("total")}
+
+    def _fail_pending(self, rid, err):
+        with self.lock:
+            slot = self.pending.get(rid)
+        if slot:
+            slot[1] = {"result": {"error_code": -1, "error": err}}
+            slot[0].set()
+
+    # ---- RTM payloads
+    def _on_rtm_text(self, text):
+        try:
+            m = json.loads(text)
+        except Exception:
+            self.log("RTM reply was not valid JSON (%d bytes; probably cut off by the message size limit)" % len(text))
+            return
+        if not isinstance(m, dict):
+            return
+        try:
+            mid = int(m.get("id"))
+        except Exception:
+            mid = None
+        meth = m.get("method")
+        if meth == 6006:
+            r = _dict(m.get("result")) or _dict(m.get("params"))
+            self.downloads[str(r.get("taskID"))] = r
+            return
+        if meth in (6000, 6008):
+            self._merge_status(_dict(m.get("result")) or _dict(m.get("params")))
+            return
+        with self.lock:
+            slot = self.pending.get(mid) if mid is not None else None
+        if meth == 1002:
+            self._merge_status(_dict(m.get("result")))
+        elif meth == 1001:
+            self.attrs = _dict(m.get("result"))
+        if slot:
+            slot[1] = m
+            slot[0].set()
+
+    def _merge_status(self, delta):
+        def merge(a, b):
+            for k, v in b.items():
+                if isinstance(v, dict) and isinstance(a.get(k), dict):
+                    merge(a[k], v)
+                else:
+                    a[k] = v
+        merge(self.status, delta)
+        try:
+            self._emit_status()
+        except Exception as e:
+            self.logs.append("emit_status failed: %r" % e)
+
+    # ---- credentials / login
+    def fetch_creds(self):
+        d = _api("/api/v1/device-management-server/device/list/agora-token", {"source": "slicer"})
+        a = d["agoraToken"]
+        devs = d.get("devices") or []
+        if not devs:
+            raise RuntimeError("No printer bound to this Elegoo account")
+        self.devices = [{"sn": x.get("serialNo"), "name": x.get("deviceName") or x.get("pcode") or x.get("serialNo")}
+                        for x in devs]
+        want = SESSION.get().get("sn")
+        dev = next((x for x in devs if x.get("serialNo") == want), devs[0])
+        self.sn = dev["serialNo"]
+        self.dev_name = dev.get("deviceName") or self.dev_name
+        self.user_id = str(a["userId"])
+        self.creds = {"appId": AGORA_APP_ID, "rtmUserId": a["rtmUserId"], "rtmToken": a["rtmToken"],
+                      "userId": self.user_id, "sn": self.sn}
+        self.rtc = {"appId": AGORA_APP_ID, "channel": self.sn, "token": a.get("rtcToken", ""),
+                    "uid": a.get("rtcUserId")}
+        return self.creds
+
+    def ensure_login(self, timeout=40):
+        if self.rtm_online:
+            return True
+        with self.login_lock:
+            if self.rtm_online:
+                return True
+            if not self.page_ready:
+                raise RuntimeError("Open the 'Elegoo CC2' tab once so the RTM page can start.")
+            if time.time() < self.login_fail_until:
+                raise RuntimeError("RTM login failed recently, retrying shortly: %s" % self.login_error)
+            for attempt in range(1, 4):
+                self.login_event.clear()
+                self.login_error = ""
+                self.fetch_creds()
+                self.gen += 1
+                self._post({"type": "login", "gen": self.gen, "cfg": self.creds})
+                if self.login_event.wait(timeout) and self.rtm_online:
+                    return True
+                if "10027" not in str(self.login_error) or attempt == 3 or not getattr(self.tl, "patient", False):
+                    break
+                self.log("RTM user still counted as online by an old session; retrying in 20 s (%d/3)" % attempt)
+                time.sleep(20)
+            self.login_fail_until = time.time() + 30
+            raise RuntimeError("RTM login failed: %s" % (self.login_error or "timeout (is ElegooSlicer closed?)"))
+
+    def _renew(self):
+        try:
+            self.fetch_creds()
+            self._post({"type": "renew", "token": self.creds["rtmToken"]})
+        except Exception as e:
+            self.log("token renew failed: %s" % e)
+
+    def logout(self):
+        self.cur_code = None
+        self.rtm_online = False
+        self.gen += 1
+        self._post({"type": "logout"})
+
+    # ---- request/response over RTM
+    def _log_entry(self, label, detail, ok, err, ms, src=None):
+        with self.data_lock:
+            self.cmd_id += 1
+            self.cmdlog.append({"id": self.cmd_id, "t": int(time.time() * 1000), "src": src or getattr(self.tl, "src", "tab"),
+                                "label": label, "detail": detail or "", "ok": bool(ok), "err": (err or "")[:240], "ms": int(ms)})
+
+    def request(self, method, params=None, timeout=20):
+        t0, err = time.time(), None
+        try:
+            return self._request(method, params, timeout)
+        except Exception as e:
+            err = str(e)
+            raise
+        finally:
+            if method not in READ_ONLY:
+                label, detail = _describe(method, params)
+                self._log_entry(label, detail, err is None, err, (time.time() - t0) * 1000)
+
+    def _record_sample(self):
+        s = self.status
+        ex, hb = _dict(s.get("extruder")), _dict(s.get("heater_bed"))
+        zt, fans = _dict(s.get("ztemperature_sensor")), _dict(s.get("fans"))
+
+        def pc(k):
+            return int(round(_num(_dict(fans.get(k)).get("speed")) * 100 / 255.0))
+        smp = [int(time.time() * 1000), _num(ex.get("temperature")), _num(ex.get("target")), _num(hb.get("temperature")),
+               _num(hb.get("target")), _num(zt.get("temperature")), pc("fan"), pc("aux_fan"), pc("box_fan")]
+        with self.data_lock:
+            self.samples.append(smp)
+
+    def _poke_status(self):
+        """Refresh the status shortly after a command so the tab shows what the printer really did."""
+        def run():
+            for d in (0.7, 2.2):
+                time.sleep(d)
+                try:
+                    self.request(1002, {}, timeout=10)
+                    self._record_sample()
+                except Exception:
+                    return
+        threading.Thread(target=run, daemon=True, name="cc2-poke").start()
+
+    def _request(self, method, params=None, timeout=20):
+        self.ensure_login()
+        with self.lock:
+            self.seq += 1
+            rid = self.seq
+            slot = [threading.Event(), None]
+            self.pending[rid] = slot
+        self._post({"type": "publish", "id": rid, "deadline": time.time() + timeout + 2,
+                    "text": json.dumps({"id": rid, "method": method, "params": params or {}})})
+        ok = slot[0].wait(timeout)
+        with self.lock:
+            self.pending.pop(rid, None)
+        if not ok:
+            self._drop_publish(rid)
+            raise RuntimeError("printer did not answer method %s" % method)
+        res = _dict((slot[1] or {}).get("result"))
+        ec = res.get("error_code", 0)
+        if ec not in (0, None):
+            err = str(res.get("error", ""))
+            if "-11033" in err:
+                self._set_printer_online(False, "The printer is offline in the Elegoo cloud (powered off or no Wi-Fi?)")
+                raise RuntimeError("printer is offline in the Elegoo cloud")
+            raise RuntimeError("printer error_code %s (%s) for method %s" % (ec, err, method))
+        self._set_printer_online(True)
+        return res
+
+    # ---- status -> Bambu-style push_status
+    LABELS = {0: "Initializing", 1: "Idle", 2: "Printing", 3: "Filament operation", 4: "Filament operation",
+              5: "Auto leveling", 6: "PID calibration", 7: "Resonance test", 8: "Self check", 9: "Updating",
+              10: "Homing", 11: "Receiving file", 12: "Composing video", 13: "Extruder operation",
+              14: "Emergency stop", 15: "Power loss recovery"}
+    # sub_status values while machine_status.status == 2 (from the elegoo-link CC2 adapter)
+    SUB2 = {1081: "Downloading", 1082: "Downloading", 1086: "Downloading", 1045: "Heating nozzle",
+            1096: "Heating nozzle", 1405: "Heating bed", 1906: "Heating bed", 2801: "Homing", 2802: "Homing",
+            2901: "Leveling", 2902: "Leveling", 2501: "Pausing", 2502: "Paused", 2505: "Paused",
+            2401: "Resuming", 2402: "Resuming", 2075: "Printing", 2077: "Finished", 2503: "Stopping",
+            2504: "Stopped"}
+
+    def _emit_status(self):
+        fn = self.cb.get("local_message")
+        if not self.sn:
+            return
+        s = self.status
+        ps, ms = _dict(s.get("print_status")), _dict(s.get("machine_status"))
+        ex, hb = _dict(s.get("extruder")), _dict(s.get("heater_bed"))
+        zt, gm = _dict(s.get("ztemperature_sensor")), _dict(s.get("gcode_move"))
+        fans, th = _dict(s.get("fans")), _dict(s.get("tool_head")) or _dict(s.get("toolhead"))
+        has_code = ms.get("status") is not None
+        code, sub = int(_num(ms.get("status"), 1)), int(_num(ms.get("sub_status"), 0))
+        pstate = str(ps.get("state", "")).lower()
+        if code == 2:
+            if sub in (2502, 2505):
+                gs = "PAUSE"
+            elif sub == 2077:
+                gs = "FINISH"
+            elif sub == 2504:
+                gs = "FAILED"
+            else:
+                gs = "RUNNING"
+        elif code == 1:
+            gs = "FINISH" if pstate in ("complete", "completed", "finished") else (
+                "FAILED" if pstate in ("cancelled", "canceled", "stopped", "failed", "error") else "IDLE")
+        elif code == 14:
+            gs = "FAILED"
+        else:
+            gs = "PREPARE"
+        label = self.SUB2.get(sub) if code == 2 and sub in self.SUB2 else self.LABELS.get(code, "Status %s" % code)
+        if has_code:
+            self.cur_code, self.status_ts = code, time.time()
+        self.cur_gs = gs
+        sw = _dict(self.attrs.get("software_version")).get("ota_version", "")
+        pct = int(_num(ps.get("progress", ms.get("progress", 0))))
+        msg = {"print": {
+            "command": "push_status", "msg": 0, "sequence_id": "0",
+            "gcode_state": gs,
+            "mc_percent": pct,
+            "mc_remaining_time": int(_num(ps.get("remaining_time_sec")) // 60),
+            "nozzle_temper": _num(ex.get("temperature")),
+            "nozzle_target_temper": _num(ex.get("target")),
+            "bed_temper": _num(hb.get("temperature")),
+            "bed_target_temper": _num(hb.get("target")),
+            "chamber_temper": _num(zt.get("temperature")),
+            "layer_num": int(_num(ps.get("current_layer"))),
+            "total_layer_num": int(_num(ps.get("total_layer"))),
+            "subtask_name": str(ps.get("filename", "") or ""),
+            "gcode_file": str(ps.get("filename", "") or ""),
+            "print_type": "local", "wifi_signal": "-50dBm", "hw_ver": "", "sw_ver": str(sw),
+        }}
+        if fn:
+            try:
+                fn(self.sn, json.dumps(msg))
+            except Exception as e:
+                self.logs.append("local_message cb failed: %r" % e)
+
+        def pc(k):
+            return int(round(_num(_dict(fans.get(k)).get("speed")) * 100 / 255.0))
+        pr = msg["print"]
+        self._post({"type": "status", "state": gs, "label": label, "code": code, "sub": sub, "progress": pct,
+                    "nozzle": pr["nozzle_temper"], "nozzle_t": pr["nozzle_target_temper"],
+                    "bed": pr["bed_temper"], "bed_t": pr["bed_target_temper"], "chamber": pr["chamber_temper"],
+                    "layer": pr["layer_num"], "total": pr["total_layer_num"], "left": pr["mc_remaining_time"],
+                    "file": pr["subtask_name"], "elapsed": int(_num(ps.get("print_duration"))), "x": _num(gm.get("x")), "y": _num(gm.get("y")), "z": _num(gm.get("z")),
+                    "homed": str(th.get("homed_axes", "") or ""), "speed": int(_num(gm.get("speed_mode"), 1)),
+                    "model_fan": pc("fan"), "aux_fan": pc("aux_fan"), "case_fan": pc("box_fan"),
+                    "light": _num(_dict(s.get("led")).get("status")) == 1})
+
+    def _fire_local_connect(self, status, msg=""):
+        fn = self.cb.get("local_connect")
+        if fn:
+            try:
+                fn(status, self.sn, msg)
+            except Exception as e:
+                self.logs.append("local_connect cb failed: %r" % e)
+
+    # ---- polling (one thread, own stop event)
+    def start_poll(self):
+      with self.poll_lock:
+        self.stop_poll()
+        ev = threading.Event()
+        self.poll_stop = ev
+
+        def run():
+            fails = 0
+            while not ev.is_set():
+                try:
+                    self.request(1002, {}, timeout=15)
+                    self._record_sample()
+                    fails = 0
+                except Exception as e:
+                    self.log("poll: %s" % e)
+                    fails += 1
+                    if "-10027" in self.login_error and fails >= 2:
+                        self.log("poll stopped: another session holds the account. Close ElegooSlicer, then press Connect.")
+                        return
+                    ev.wait(15 if not self.printer_online else 10)
+                    continue
+                ev.wait(5)
+        self.poll_thread = threading.Thread(target=run, daemon=True, name="cc2-poll")
+        self.poll_thread.start()
+
+    def stop_poll(self):
+        self.poll_stop.set()
+
+
+HUB = Hub()
+
+
+# --------------------------------------------------------------------------- upload + print
+def upload_gcode(data, name, progress=None, cancel_fn=None):
+    """OSS upload via biz-entrypoint from bytes; returns (accessUrl, md5hex)."""
+    size = len(data)
+    if size == 0:
+        raise RuntimeError("empty file")
+    if size >= 500 * 1024 * 1024:
+        raise RuntimeError("file >= 500 MB: multipart upload not implemented in v0.1")
+    raw = hashlib.md5(data).digest()
+    md5b64, md5hex = base64.b64encode(raw).decode(), raw.hex()
+    d = _api("/api/v1/device-management-server/oss/biz-entrypoint",
+             {"filename": name, "bucketAlias": "iot-private", "module": "gcode", "fileMd5": md5b64})
+    if progress:
+        progress(10)
+    if cancel_fn and cancel_fn():
+        raise RuntimeError("cancelled")
+    status, _ = _http("PUT", d["entrypoint"], {"Content-Type": "application/octet-stream",
+                                                "Content-MD5": md5b64}, data=data, timeout=900)
+    if not 200 <= status < 300:
+        raise RuntimeError("upload HTTP %s" % status)
+    if progress:
+        progress(100)
+    return d["accessUrl"], md5hex
+
+
+def _remote_name(p):
+    base = os.path.basename(getattr(p, "dst_file", "") or getattr(p, "filename", "") or "print.gcode")
+    if not base.lower().endswith(".gcode"):
+        base = (getattr(p, "project_name", "") or os.path.splitext(base)[0] or "print") + ".gcode"
+    return "".join(c if (c.isalnum() or c in "._- ()") else "_" for c in base)
+
+
+def _send_to_printer(p, update_fn, cancel_fn):
+    name = _remote_name(p)
+    cb = lambda pct: update_fn and update_fn(ST_UPLOAD, pct, "Uploading to Elegoo cloud")
+    t_up = time.time()
+    try:
+        gdata = _plate_gcode(p)
+        url, md5hex = upload_gcode(gdata, name, cb, cancel_fn)
+        HUB._log_entry("Upload to cloud", "%s (%.1f MB)" % (name, len(gdata) / 1048576.0), True, "", (time.time() - t_up) * 1000)
+    except Exception as e:
+        HUB._log_entry("Upload to cloud", name, False, str(e), (time.time() - t_up) * 1000)
+        raise
+    task = uuid.uuid4().hex
+    update_fn and update_fn(ST_SEND, 0, "Printer is downloading the file")
+    try:
+        # verified live: result error_code 0, then 6006 {progress:100,status:0,taskID}
+        HUB.request(1057, {"filename": name, "url": url, "md5": md5hex, "taskID": task}, timeout=30)
+        t0 = last_change = time.time()
+        last = None
+        while time.time() - t0 < 900:
+            d = HUB.downloads.get(task)
+            if d:
+                pr = _num(d.get("progress"))
+                if pr >= 100:
+                    return name
+                if d.get("error_code") not in (0, None):
+                    raise RuntimeError("printer download failed (error %s)" % d.get("error_code"))
+                if (pr, d.get("status")) != last:
+                    last, last_change = (pr, d.get("status")), time.time()
+                    update_fn and update_fn(ST_SEND, int(pr), "Printer download %d%%" % pr)
+            if time.time() - last_change > 180:
+                raise RuntimeError("printer download stalled")
+            if cancel_fn and cancel_fn():
+                try:
+                    HUB.request(1058, {"taskID": task}, timeout=10)
+                except Exception:
+                    pass
+                raise RuntimeError("cancelled")
+            time.sleep(1)
+        raise RuntimeError("printer download timed out")
+    finally:
+        HUB.downloads.pop(task, None)
+
+
+def _slot_map(p):
+    """slot_map from Orca's filament->slot mapping (JSON list; value = canvas*4 + tray); fallback: first tray."""
+    out = []
+    HUB.log("ams_mapping raw: %r" % (getattr(p, "ams_mapping", ""),))
+    try:
+        am = json.loads(getattr(p, "ams_mapping", "") or "[]")
+        if isinstance(am, list):
+            for t, v in enumerate(am):
+                if isinstance(v, int) and 0 <= v < 16:
+                    out.append({"t": t, "canvas_id": v // 4, "tray_id": v % 4})
+    except Exception:
+        pass
+    if out:
+        return out
+    try:
+        r = HUB.request(2005, {}, timeout=10)
+        for c in _dict(r.get("canvas_info")).get("canvas_list", []):
+            if c.get("connected") and c.get("tray_list"):
+                HUB.log("WARNING: no filament mapping from Orca; using first tray of canvas %s" % c.get("canvas_id", 0))
+                return [{"t": 0, "canvas_id": c.get("canvas_id", 0), "tray_id": c["tray_list"][0].get("tray_id", 0)}]
+    except Exception as e:
+        HUB.log("canvas query: %s" % e)
+    return []
+
+
+def _start_print(name, p):
+    # wire format identical to what ElegooSlicer sends (seen in its debug log)
+    cfg = {"delay_video": False, "printer_check": bool(getattr(p, "auto_bed_leveling", False)),
+           "print_layout": "A", "bedlevel_force": False, "slot_map": _slot_map(p)}
+    HUB.request(1020, {"filename": name, "storage_media": "local", "config": cfg}, timeout=30)
+
+
+def _in_plugin_thread(fn):
+    """start_* run on host job threads where audited I/O is denied until the user answers a prompt.
+    Plugin-spawned threads are not audited, so do the work there and wait for it."""
+    box = {}
+
+    def run():
+        HUB.tl.src = "orca"
+        try:
+            box["r"] = fn()
+        except BaseException as e:  # noqa
+            box["e"] = e
+    t = threading.Thread(target=run, daemon=True, name="cc2-job")
+    t.start()
+    t.join()
+    if "e" in box:
+        raise box["e"]
+    return box.get("r")
+
+
+def _plate_gcode(p, data=None):
+    """Read the file Orca hands over. If it is a .gcode.3mf (zip), return the plate's gcode bytes."""
+    data = data if data is not None else _read_bytes(p.filename)
+    is_zip = data[:2] == b"PK"
+    HUB.log("send file: %s (%s, %d bytes)" % (os.path.basename(p.filename or "orca"), "zip/3mf" if is_zip else "plain", len(data)))
+    if not is_zip:
+        return data
+    idx = int(_num(getattr(p, "plate_index", 1), 1)) or 1
+    with zipfile.ZipFile(io.BytesIO(data)) as z:
+        names = z.namelist()
+        want = [n for n in names if n.lower() == "metadata/plate_%d.gcode" % idx] or \
+               [n for n in names if n.lower().startswith("metadata/plate_") and n.lower().endswith(".gcode")]
+        if not want:
+            raise RuntimeError("no plate gcode inside the 3mf")
+        return z.read(want[0])
+
+
+
+# --------------------------------------------------------------------------- local "Elegoo Link" bridge
+# Orca's own Elegoo Link host speaks plain HTTP to a CC2 on the LAN: GET /system/info and chunked PUT /upload
+# (1 MiB parts with Content-Range, X-File-Name, X-File-MD5, X-Token). This loopback server answers those two calls
+# and forwards the finished file to the Elegoo cloud, so Orca's normal Print button works with the cloud printer.
+BRIDGE_PORT = 47890
+
+
+class LanBridge(LoginProxy):
+    def __init__(self, log):
+        LoginProxy.__init__(self, None, log)
+        self.parts = {}          # (name, md5) -> bytearray
+        self.lock2 = threading.Lock()
+
+    def start(self):
+        if not IS_WINDOWS:
+            return self._start_linux(BRIDGE_PORT)
+        _wsa()
+        for port in (BRIDGE_PORT, 0):
+            s = _ws.socket(2, 1, 6)
+            if s == _INVALID_SOCK:
+                raise OSError("socket failed (%d)" % ctypes.get_last_error())
+            sa = _SockAddrIn(2, ((port & 0xFF) << 8) | (port >> 8), (ctypes.c_ubyte * 4)(127, 0, 0, 1))
+            if _ws.bind(s, ctypes.byref(sa), ctypes.sizeof(sa)) == 0 and _ws.listen(s, 16) == 0:
+                n = ctypes.c_int(ctypes.sizeof(sa))
+                _ws.getsockname(s, ctypes.byref(sa), ctypes.byref(n))
+                self.port = ((sa.port & 0xFF) << 8) | (sa.port >> 8)
+                self.sock = s
+                self.thread = threading.Thread(target=self._accept_windows, daemon=True, name="cc2-bridge")
+                self.thread.start()
+                return self.port
+            _ws.closesocket(s)
+        raise OSError("bridge: cannot bind a loopback port")
+
+    def _json(self, c, obj, status=200, reason="OK"):
+        self._reply(c, status, json.dumps(obj).encode(), [("Content-Type", "application/json")], reason=reason)
+
+    def _serve(self, c):
+        try:
+            self._client_timeout(c, 60)
+            data = b""
+            while b"\r\n\r\n" not in data and len(data) < 65536:
+                chunk = self._recv(c)
+                if not chunk:
+                    return
+                data += chunk
+            head, _, rest = data.partition(b"\r\n\r\n")
+            lines = head.decode("latin-1").split("\r\n")
+            method, target, _v = lines[0].split(" ", 2)
+            hdrs = {}
+            for ln in lines[1:]:
+                if ":" in ln:
+                    k, v = ln.split(":", 1)
+                    hdrs[k.strip().lower()] = v.strip()
+            if hdrs.get("host", "").split(":")[0] not in ("127.0.0.1", "localhost"):     # DNS-rebinding protection
+                return self._reply(c, 403, b"forbidden", reason="Forbidden")
+            need = int(hdrs.get("content-length", "0") or 0)
+            if need > 2 * 1024 * 1024:
+                return self._reply(c, 413, b"too large", reason="Payload Too Large")
+            body = rest
+            while len(body) < need:
+                chunk = self._recv(c)
+                if not chunk:
+                    return
+                body += chunk
+            body = body[:need]
+            path = target.split("?", 1)[0]
+            if method == "GET" and path.rstrip("/") == "/system/info":
+                sn = HUB.sn or SESSION.get().get("sn", "") or "ELEGOO-CLOUD"
+                return self._json(c, {"error_code": 0, "message": "OK", "system_info": {"sn": sn}})
+            if method in ("PUT", "POST") and path.rstrip("/") == "/upload":
+                return self._upload(c, hdrs, body)
+            return self._json(c, {"error_code": -1, "message": "not supported by the cloud bridge"}, 404, "Not Found")
+        except Exception as e:  # noqa
+            try:
+                self.log("bridge: %r" % e)
+                self._json(c, {"error_code": -1, "message": str(e)[:200]}, 500, "Error")
+            except Exception:
+                pass
+        finally:
+            self._finish_client(c)
+
+    def _upload(self, c, hdrs, body):
+        import re
+        raw_name = hdrs.get("x-file-name", "") or "print.gcode"
+        try:
+            raw_name = raw_name.encode("latin-1").decode("utf-8")
+        except Exception:
+            pass
+        from urllib.parse import unquote
+        name = unquote(raw_name) if "%" in raw_name else raw_name
+        name = os.path.basename(name.replace("\\", "/")) or "print.gcode"
+        name = "".join(ch if (ch.isalnum() or ch in "._- ()") else "_" for ch in name)
+        if not name.lower().endswith(".gcode"):
+            name += ".gcode"
+        md5 = hdrs.get("x-file-md5", "").lower()
+        m = re.match(r"bytes\s+(\d+)-(\d+)/(\d+)", hdrs.get("content-range", ""))
+        if not m:
+            return self._json(c, {"error_code": -1, "message": "missing Content-Range"}, 400, "Bad Request")
+        a, b, total = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        key = (name, md5)
+        with self.lock2:
+            buf = self.parts.setdefault(key, bytearray())
+            if a == 0:
+                del buf[:]
+                self.log("bridge: receiving %s (%.1f MB) from Orca" % (name, total / 1048576.0))
+            if a != len(buf):
+                self.parts.pop(key, None)
+                return self._json(c, {"error_code": -1, "message": "chunk out of order"}, 409, "Conflict")
+            buf += body
+            done = b + 1 >= total and len(buf) >= total
+            data = bytes(self.parts.pop(key)) if done else None
+        if not done:
+            return self._json(c, {"error_code": 0, "message": "OK"})
+        HUB.tl.src = "orca"
+        HUB.tl.patient = True
+        t0 = time.time()
+        try:
+            if data[:2] == b"PK":
+                import types
+                data = _plate_gcode(types.SimpleNamespace(filename=None, plate_index=1), data)
+            if md5 and hashlib.md5(data).hexdigest() != md5 and data[:2] != b"PK":
+                self.log("bridge: MD5 differs from Orca's header (continuing)")
+            self._to_cloud(name, data)
+        except Exception as e:
+            HUB._log_entry("Orca upload", name, False, str(e), (time.time() - t0) * 1000)
+            HUB.log("bridge upload failed: %s" % e)
+            return self._json(c, {"error_code": -1, "message": str(e)[:200]})
+        HUB._log_entry("Orca upload", "%s (%.1f MB)" % (name, len(data) / 1048576.0), True, "", (time.time() - t0) * 1000)
+        if _prefs_get().get("autostart"):
+            threading.Thread(target=self._autostart, args=(name, data), daemon=True, name="cc2-autostart").start()
+        else:
+            HUB._post({"type": "note", "text": "Received %s from Orca - press Print on it in Printer files" % name, "kind": "ok"})
+        return self._json(c, {"error_code": 0, "message": "OK"})
+
+    @staticmethod
+    def _filament_types(data):
+        import re
+        m = re.search(rb"; filament_type = ([^\r\n]*)", data[-200000:])
+        return [x.strip().upper() for x in m.group(1).decode("latin-1").split(";")] if m else []
+
+    def _autostart(self, name, data):
+        HUB.tl.src = "orca"
+        t0 = time.time()
+        try:
+            time.sleep(2)
+            HUB.request(1002, {}, timeout=15)
+            for _ in range(20):                      # the printer may still be finishing the download
+                if HUB.is_idle():
+                    break
+                time.sleep(2)
+                HUB.request(1002, {}, timeout=15)
+            else:
+                raise RuntimeError("the printer is not idle, so the print was not started (press Print in Printer files)")
+            r = HUB.request(2005, {}, timeout=15)
+            trays = []
+            for cv in _dict(r.get("canvas_info")).get("canvas_list", []):
+                if cv.get("connected"):
+                    for t in cv.get("tray_list", []):
+                        trays.append((cv.get("canvas_id", 0), t.get("tray_id", 0), str(t.get("filament_type", "")).upper()))
+            types = self._filament_types(data) or ["PLA"]
+            slots, used = [], set()
+            for i, ft in enumerate(types):
+                pick = next((t for t in trays if t[2] == ft and (t[0], t[1]) not in used), None) or                        next((t for t in trays if (t[0], t[1]) not in used), None) or (trays[0] if trays else None)
+                if pick:
+                    used.add((pick[0], pick[1]))
+                    slots.append({"t": i, "canvas_id": pick[0], "tray_id": pick[1]})
+            HUB.log("auto-start slot map: %s (filament types %s)" % (slots, types))
+            cfg = {"delay_video": False, "printer_check": False, "print_layout": "A", "bedlevel_force": False, "slot_map": slots}
+            HUB.request(1020, {"filename": name, "storage_media": "local", "config": cfg}, timeout=30)
+            HUB._poke_status()
+            HUB._post({"type": "note", "text": "Print started: %s" % name, "kind": "ok"})
+        except Exception as e:
+            HUB._log_entry("Auto-start print", name, False, str(e), (time.time() - t0) * 1000)
+            HUB._post({"type": "note", "text": "Auto-start failed: %s" % e, "kind": "bad"})
+
+    def _to_cloud(self, name, data):
+        url, md5hex = upload_gcode(data, name)
+        task = uuid.uuid4().hex
+        HUB.request(1057, {"filename": name, "url": url, "md5": md5hex, "taskID": task}, timeout=30)
+        t0 = last = time.time()
+        try:
+            while time.time() - t0 < 150:      # Orca waits at most ~180 s per request
+                d = HUB.downloads.get(task)
+                if d and _num(d.get("progress")) >= 100:
+                    return
+                if d and d.get("error_code") not in (0, None):
+                    raise RuntimeError("printer download failed (error %s)" % d.get("error_code"))
+                time.sleep(1)
+        finally:
+            HUB.downloads.pop(task, None)
+
+
+def _watchdog(stop):
+    """Keep the cloud link alive: when 'Connect automatically' is on and the tab is open, reconnect if the poll loop
+    died or RTM dropped (e.g. after -10027, a Wi-Fi blip, or the printer coming back from sleep)."""
+    while not stop.wait(30):
+        try:
+            if not (SESSION.logged_in() and SESSION.get().get("auto", True) and HUB.page_ready):
+                continue
+            alive = HUB.poll_thread is not None and HUB.poll_thread.is_alive() and not HUB.poll_stop.is_set()
+            if alive and HUB.rtm_online:
+                continue
+            HUB.log("watchdog: link is down, reconnecting")
+            HUB.connect_cloud()
+        except Exception as e:  # noqa
+            HUB.log("watchdog: %s" % e)
+
+
+BRIDGE = None
+WATCHDOG_STOP = None
+
+
+def _start_bridge():
+    global BRIDGE, WATCHDOG_STOP
+    if WATCHDOG_STOP is None:
+        WATCHDOG_STOP = threading.Event()
+        threading.Thread(target=_watchdog, args=(WATCHDOG_STOP,), daemon=True, name="cc2-watchdog").start()
+    if BRIDGE is not None:
+        return
+    try:
+        bridge = LanBridge(HUB.log)
+        port = bridge.start()
+    except OSError as error:
+        HUB.log("Orca bridge could not bind 127.0.0.1:%d: %s" % (BRIDGE_PORT, error))
+        return
+    BRIDGE = bridge
+    HUB.log("Orca bridge listening on 127.0.0.1:%d (Elegoo Link host)" % port)
+
+
+def _stop_bridge():
+    global BRIDGE, WATCHDOG_STOP
+    if WATCHDOG_STOP is not None:
+        WATCHDOG_STOP.set()
+        WATCHDOG_STOP = None
+    if BRIDGE is not None:
+        BRIDGE.stop()
+        BRIDGE = None
+
+
+# --------------------------------------------------------------------------- agent
+class CC2Agent(pa.PrinterAgentBase):
+    def __init__(self):
+        super().__init__()
+
+    def on_load(self):
+        _start_bridge()
+
+    def on_unload(self):
+        _stop_bridge()
+        HUB._stop_login_proxy()
+        HUB.want_poll = False
+        HUB.stop_poll()
+
+    def get_name(self):
+        return "Elegoo CC2 Cloud"
+
+    def get_agent_info(self):
+        i = pa.AgentInfo()
+        i.id, i.name, i.version = AGENT_ID, "Elegoo CC2 (cloud)", "0.6.0"
+        i.description = "Elegoo Centauri Carbon 2 via the Elegoo cloud"
+        return i
+
+    # ---- callbacks
+    def _setter(key):
+        def f(self, fn):
+            HUB.cb[key] = fn
+            if key == "queue_main":
+                HUB.queue_main = fn
+            return 0
+        return f
+
+    set_server_callback = _setter("server")
+    set_on_ssdp_msg_fn = _setter("ssdp")
+    set_on_printer_connected_fn = _setter("printer_connected")
+    set_on_subscribe_failure_fn = _setter("sub_fail")
+    set_on_message_fn = _setter("message")
+    set_on_user_message_fn = _setter("user_message")
+    set_on_local_connect_fn = _setter("local_connect")
+    set_on_local_message_fn = _setter("local_message")
+    set_queue_on_main_fn = _setter("queue_main")
+    del _setter
+
+    # ---- discovery / selection
+    def start_discovery(self, start, sending):
+        if not start:
+            return True
+
+        def run():
+            try:
+                HUB.fetch_creds()
+                fn = HUB.cb.get("ssdp")
+                if fn:
+                    fn(json.dumps({"dev_id": HUB.sn, "dev_name": HUB.dev_name, "dev_ip": "cloud",
+                                   "dev_type": "Centauri Carbon 2", "dev_signal": "0",
+                                   "connect_type": "lan", "bind_state": "free"}))
+            except Exception as e:
+                HUB.log("discovery: %s" % e)
+        threading.Thread(target=run, daemon=True).start()
+        return True
+
+    def bind_detect(self, dev_ip, sec_link, detect):
+        try:
+            detect.result_msg, detect.command = "ok", "bind_detect"
+            detect.dev_id, detect.dev_name = HUB.sn, HUB.dev_name
+            detect.model_id, detect.version = "", ""
+            detect.bind_state, detect.connect_type = "free", "lan"
+            return 0
+        except Exception:
+            return -1
+
+    def get_user_selected_machine(self):
+        return HUB.sn
+
+    def set_user_selected_machine(self, dev_id):
+        return 0
+
+    # ---- connect
+    def connect_printer(self, params):
+        def run():
+            try:
+                if not SESSION.logged_in():
+                    raise RuntimeError("Not signed in: open the Elegoo CC2 tab and use Sign in.")
+                HUB.ensure_login()
+                HUB.request(1001, {}, timeout=15)
+                HUB.was_connected = True
+                HUB.want_poll = True
+                HUB._fire_local_connect(0, "")
+                HUB.start_poll()
+            except Exception as e:
+                HUB.log("connect failed: %s" % e)
+                HUB._fire_local_connect(1, str(e))
+        threading.Thread(target=run, daemon=True).start()
+        return 0
+
+    def disconnect_printer(self):
+        # Orca calls this when it switches machines or finishes a job. The cloud link belongs to the Elegoo CC2 tab
+        # (Connect / Log out there), so keep it alive instead of tearing it down.
+        HUB.log("Orca asked to disconnect the printer (ignored; the tab keeps the cloud link)")
+        return 0
+
+    # ---- messaging (translate Bambu-style JSON used by default command_* implementations)
+    def send_message(self, dev_id, json_str, qos, flag):
+        return -7010
+
+    def send_message_to_printer(self, dev_id, json_str, qos, flag):
+        try:
+            doc = json.loads(json_str) or {}
+            if "pushing" in doc or "info" in doc or "system" in doc:
+                return 0   # Bambu-style state polling; the plugin gets status over RTM on its own
+            p = doc.get("print", {})
+            cmd, param = p.get("command"), str(p.get("param", ""))
+            if cmd == "pause":
+                return self._rc(1021)
+            if cmd == "resume":
+                return self._rc(1023)
+            if cmd == "stop":
+                return self._rc(1022)
+            if cmd == "gcode_line":
+                return self._gcode(param)
+            if cmd in ("print_speed", "set_speed"):
+                return self._rc(1031, {"mode": int(p.get("param", 1))})
+            return -7010
+        except Exception as e:
+            HUB.log("send_message_to_printer: %s" % e)
+            return -1
+
+    def _rc(self, method, params=None):
+        def run():
+            HUB.tl.src = "orca"
+            try:
+                HUB._exec_ui(method, params or {})
+            except Exception as e:
+                HUB.log("cmd %s: %s" % (method, e))
+        threading.Thread(target=run, daemon=True).start()
+        return 0
+
+    def _gcode(self, g):
+        import re
+        temps, handled = {}, False
+        for line in g.splitlines():
+            line = line.split(";")[0].strip()
+            m = re.match(r"M104\s+S(\d+)", line)
+            if m:
+                temps["extruder"] = int(m.group(1))
+            m = re.match(r"M140\s+S(\d+)", line)
+            if m:
+                temps["heater_bed"] = int(m.group(1))
+        if temps:
+            handled = True
+            self._rc(1028, temps)
+        if any(re.match(r"G28\b", ln.split(";")[0].strip()) for ln in g.splitlines()):
+            handled = True
+            self._rc(1026, {"homed_axes": "xyz"})
+        return 0 if handled else -7010
+
+    def command_set_nozzle(self, dev_id, temp, sequence_id, lan_mode):
+        return self._rc(1028, {"extruder": int(temp)})
+
+    def command_set_bed(self, dev_id, temp, supports_mqtt_bed_ctrl, sequence_id, lan_mode):
+        return self._rc(1028, {"heater_bed": int(temp)})
+
+    def command_go_home(self, dev_id, is_printing, supports_mqtt_homing, sequence_id, lan_mode):
+        return self._rc(1026, {"homed_axes": "xyz"})
+
+    def command_axis_control(self, dev_id, axis, unit, input_val, speed, is_core_xy,
+                             supports_mqtt_axis_control, sequence_id, lan_mode):
+        try:
+            return self._rc(1027, {"axes": str(axis).lower().replace("+", "").replace("-", ""),
+                                   "distance": float(input_val) * (float(unit) if unit else 1.0)})
+        except Exception:
+            return -7010
+
+    def command_xyz_abs(self, dev_id, sequence_id, lan_mode):
+        return 0
+
+    def command_auto_leveling(self, dev_id, sequence_id, lan_mode):
+        return -7010
+
+    # ---- printing
+    def start_send_gcode_to_sdcard(self, params, update_fn, cancel_fn, wait_fn):
+        if getattr(params, "project_name", "") == "verify_job":
+            try:
+                _in_plugin_thread(HUB.ensure_login)
+                return 0
+            except Exception as e:
+                HUB.log("verify: %s" % e)
+                return -1
+        try:
+            _in_plugin_thread(lambda: _send_to_printer(params, update_fn, cancel_fn))
+            update_fn and update_fn(ST_DONE, 100, "Sent")
+            return 0
+        except Exception as e:
+            HUB.log("send failed: %s" % e)
+            update_fn and update_fn(ST_ERR, -1, str(e))
+            return -1
+
+    def start_local_print(self, params, update_fn, cancel_fn):
+        try:
+            def job():
+                name = _send_to_printer(params, update_fn, cancel_fn)
+                update_fn and update_fn(ST_WAIT, 0, "Starting print")
+                _start_print(name, params)
+            _in_plugin_thread(job)
+            update_fn and update_fn(ST_DONE, 100, "Print started")
+            return 0
+        except Exception as e:
+            HUB.log("print failed: %s" % e)
+            update_fn and update_fn(ST_ERR, -1, str(e))
+            return -1
+
+    def start_print(self, params, update_fn, cancel_fn, wait_fn):
+        return self.start_local_print(params, update_fn, cancel_fn)
+
+    def start_local_print_with_record(self, params, update_fn, cancel_fn, wait_fn):
+        return self.start_local_print(params, update_fn, cancel_fn)
+
+    def start_sdcard_print(self, params, update_fn, cancel_fn):
+        try:
+            _in_plugin_thread(lambda: _start_print(_remote_name(params), params))
+            return 0
+        except Exception as e:
+            HUB.log("sdcard print failed: %s" % e)
+            return -1
+
+    # ---- binding stubs (no pairing step)
+    def check_cert(self):
+        return 0
+
+    def ping_bind(self, ping_code):
+        return 0
+
+    def bind(self, dev_ip, dev_id, dev_model, sec_link, timezone, improved, update_fn):
+        return 0
+
+    def unbind(self, dev_id):
+        return 0
+
+    def request_bind_ticket(self):
+        return (0, "")
+
+    # ---- camera: not implemented in v0.1
+    def get_camera_stream_mode(self):
+        return pa.CameraStreamMode.None_
+
+    def get_camera_url(self):
+        return ""
+
+    def command_start_camera(self, dev_id):
+        return -7010
+
+
+# --------------------------------------------------------------------------- page (RTM transport)
+ICON_SVG = r"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <rect width="128" height="128" rx="26" fill="#0f766e"/>
+  <!-- cloud -->
+  <path transform="translate(0 4)" d="M40 58a15 15 0 0 1 14-20 20 20 0 0 1 37 6 13 13 0 0 1-1 26H44a12 12 0 0 1-4-12z"
+        fill="#ccfbf1" opacity="0.95"/>
+  <!-- printer frame -->
+  <rect x="34" y="66" width="60" height="44" rx="5" fill="none" stroke="#f0fdfa" stroke-width="5"/>
+  <!-- gantry + nozzle -->
+  <line x1="34" y1="80" x2="94" y2="80" stroke="#f0fdfa" stroke-width="4"/>
+  <rect x="58" y="76" width="12" height="9" rx="2" fill="#5eead4"/>
+  <path d="M61 85h6l-3 6z" fill="#5eead4"/>
+  <!-- printed layers -->
+  <rect x="50" y="102" width="28" height="4" rx="1.5" fill="#99f6e4"/>
+  <rect x="54" y="97" width="20" height="4" rx="1.5" fill="#5eead4"/>
+  <!-- label -->
+  <text x="64" y="27" text-anchor="middle" font-family="Arial,Helvetica,sans-serif" font-weight="700"
+        font-size="19" fill="#ffffff">CC2</text>
+</svg>
+"""
+
+PAGE_HTML = r"""<!doctype html><meta charset="utf-8">
+<style>
+ :root{--mono:ui-monospace,"JetBrains Mono","Fira Code",SFMono-Regular,Menlo,Consolas,monospace;--sans:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+ /* default = simple dark */
+ :root,:root[data-theme="simple-dark"]{--bg:#1c1c1e;--bgimg:none;--panel:#262628;--panel2:#313134;--line:#3d3d41;--text:#ececee;--dim:#9a9aa1;--acc:#4f8cff;--acc2:#3d78e6;--glow:rgba(79,140,255,.28);
+  --ok:#4cc38a;--bad:#ff6b6b;--warn:#e6b450;--shadow:none;--onacc:#fff;--grid:transparent;--bf:none;--radius:12px}
+ :root[data-theme="simple-light"]{--bg:#f4f4f6;--bgimg:none;--panel:#ffffff;--panel2:#eeeef1;--line:#dcdce1;--text:#1c1c1e;--dim:#66666e;--acc:#2563eb;--acc2:#1d4fc4;--glow:rgba(37,99,235,.2);
+  --ok:#168a5a;--bad:#c9302c;--warn:#9a6300;--shadow:none;--onacc:#fff;--grid:transparent;--bf:none;--radius:12px}
+ /* 0xpraet0rian: navy with a faint grid, orange accent, glass panels (the author's site) */
+ :root[data-theme="0x"]{--bg:#141b28;--bgimg:radial-gradient(circle at 15% 0%,#1f2c40 0%,#0f151f 60%);--panel:rgba(255,255,255,.06);--panel2:rgba(255,255,255,.1);--line:rgba(255,255,255,.12);
+  --text:#edf1f5;--dim:#9fb0c3;--acc:#ff6600;--acc2:#cc5200;--glow:rgba(255,102,0,.35);--ok:#3ddc97;--bad:#ff6b6b;--warn:#ffb020;--shadow:0 8px 32px rgba(0,0,0,.45);--onacc:#fff;
+  --grid:rgba(255,255,255,.035);--bf:blur(18px) saturate(140%);--radius:16px}
+ *{box-sizing:border-box}
+ html,body{margin:0;width:100%;min-height:100%}
+ body{font:13px/1.5 var(--sans);color:var(--text);background:var(--bg) var(--bgimg) fixed;position:relative}
+ body::before{content:"";position:fixed;inset:0;pointer-events:none;background-image:linear-gradient(var(--grid) 1px,transparent 1px),linear-gradient(90deg,var(--grid) 1px,transparent 1px);background-size:44px 44px}
+ #app{position:relative;width:100%;max-width:1840px;margin:0 auto;padding:22px clamp(12px,2.2vw,36px) 36px}
+ h3{margin:0;font:650 14px var(--sans);color:var(--text);letter-spacing:.01em}
+ .mut{color:var(--dim)} b{font-weight:600} a{color:var(--acc);text-decoration:none;cursor:pointer} a:hover{text-decoration:underline}
+ .top{display:flex;gap:16px;align-items:center;flex-wrap:wrap;margin-bottom:18px}
+ .top svg{flex:none;border-radius:12px}
+ .top .name{font-size:26px;font-weight:700;line-height:1.1;letter-spacing:-.01em}
+ .right{margin-left:auto;display:flex;flex-direction:column;align-items:flex-end;gap:8px}
+ .chips{display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end}
+ .chip{display:inline-flex;align-items:center;gap:6px;padding:3px 11px;border-radius:999px;border:1px solid var(--line);background:var(--panel);font:12px var(--mono);white-space:nowrap}
+ .chip::before{content:"";width:7px;height:7px;border-radius:50%;background:var(--dim);opacity:.7}
+ .chip.ok{border-color:var(--ok);color:var(--ok)} .chip.ok::before{background:var(--ok);opacity:1}
+ .chip.bad{border-color:var(--bad);color:var(--bad)} .chip.bad::before{background:var(--bad);opacity:1}
+ .chip.warn{border-color:var(--warn);color:var(--warn)} .chip.warn::before{background:var(--warn);opacity:1}
+ .themebar{display:flex;gap:6px;align-items:center;font:12px var(--mono);color:var(--dim)}
+ .cols{display:flex;flex-direction:column;gap:16px;transition:opacity .2s}
+ .split{display:grid;grid-template-columns:1fr;gap:16px;align-items:start}
+ .col{display:flex;flex-direction:column;gap:16px;min-width:0}
+ @media (min-width:900px){.split{grid-template-columns:repeat(2,minmax(0,1fr))}}
+ .card{display:flex;flex-direction:column;background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:16px 18px;box-shadow:var(--shadow);backdrop-filter:var(--bf);-webkit-backdrop-filter:var(--bf)}
+ .card>h3{display:flex;align-items:center;gap:0;margin-bottom:14px;min-height:28px}
+ .card>h3>*:first-child{margin-left:auto}
+ .card>h3 .mut{font:500 12px var(--sans)}
+ button{font:inherit;font-weight:500;padding:5px 13px;min-height:30px;border:1px solid var(--line);border-radius:10px;background:var(--panel2);color:var(--text);cursor:pointer;transition:border-color .12s,box-shadow .12s,transform .05s,background .12s}
+ button:hover:not(:disabled){border-color:var(--acc);box-shadow:0 0 0 3px var(--glow)} button:active:not(:disabled){transform:translateY(1px)}
+ button:disabled{opacity:.4;cursor:not-allowed}
+ button.pri{background:var(--acc);border-color:var(--acc);color:var(--onacc);box-shadow:0 4px 16px var(--glow)} button.pri:hover:not(:disabled){background:var(--acc2);border-color:var(--acc2)}
+ button.dng{color:var(--bad);border-color:var(--bad);background:transparent} button.dng:hover:not(:disabled){background:var(--bad);color:#fff;box-shadow:none}
+ button.sel{background:var(--acc);border-color:var(--acc);color:var(--onacc)}
+ button.ico{min-width:30px;padding:3px 8px;font-size:15px}
+ input[type=number],select{font:inherit;padding:4px 9px;min-height:30px;border:1px solid var(--line);border-radius:10px;background:var(--panel2);color:var(--text)}
+ select option{background:#222;color:#eee} input[type=number]{width:74px}
+ input[type=range]{accent-color:var(--acc);width:100%} input[type=checkbox]{accent-color:var(--acc)}
+ .row{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:7px 0}
+ .bar{height:10px;border-radius:6px;background:var(--panel2);overflow:hidden} .bar>i{display:block;height:100%;background:linear-gradient(90deg,var(--acc2),var(--acc));width:0%;transition:width .4s;box-shadow:0 0 12px var(--glow)}
+ .kv{display:grid;grid-template-columns:repeat(auto-fit,minmax(90px,1fr));gap:10px;margin:14px 0} .kv div{display:flex;flex-direction:column}
+ .k{font:11px var(--mono);text-transform:uppercase;letter-spacing:.06em;color:var(--dim)} .v{font-weight:650;font-size:16px}
+ .pad{display:grid;grid-template-columns:repeat(3,48px);grid-template-rows:repeat(3,42px);gap:6px} .pad button{padding:0}
+ .zcol{display:flex;flex-direction:column;gap:6px} .zcol button{width:48px;height:42px;padding:0}
+ .zcol.hall button{width:auto;height:auto;min-width:92px;min-height:42px;padding:8px 16px;white-space:nowrap}
+ .slots{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:12px;margin:6px 0}
+ .slot{border:2px solid var(--line);border-radius:14px;padding:12px 6px;text-align:center;cursor:pointer;background:var(--panel2);transition:border-color .12s,box-shadow .12s}
+ .slot:hover{border-color:var(--acc)} .slot.on{border-color:var(--acc);box-shadow:0 0 0 4px var(--glow)}
+ .slot .dot{width:38px;height:38px;border-radius:50%;margin:0 auto 6px;border:1px solid #0004}
+ .slot small{display:block;color:var(--dim);font-family:var(--mono)} .slot.empty .dot{background:repeating-linear-gradient(45deg,#777,#777 4px,#999 4px,#999 8px)}
+ table{width:100%;border-collapse:collapse} th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--line);vertical-align:middle}
+ tr:hover td{background:var(--panel2)} th{font:11px var(--mono);text-transform:uppercase;letter-spacing:.06em;color:var(--dim);font-weight:500}
+ td.n{max-width:420px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--mono);font-size:12px}
+ .tabs{display:flex;gap:6px;align-items:center} .dots i{display:inline-block;width:11px;height:11px;border-radius:50%;margin-right:3px;border:1px solid #0004}
+ .toolbar{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;flex-wrap:wrap;gap:8px}
+ #note{position:sticky;top:8px;z-index:5;margin:0 0 14px;padding:10px 16px;border-radius:12px;display:none;border:1px solid var(--line);background:var(--panel);box-shadow:var(--shadow);backdrop-filter:var(--bf)}
+ #note.bad{border-color:var(--bad);color:var(--bad)} #note.ok{border-color:var(--ok);color:var(--ok)}
+ .cols.off{opacity:.36;pointer-events:none;filter:grayscale(.6)}
+ .panel{border:1px dashed var(--acc);border-radius:12px;padding:12px 14px;margin:10px 0;background:var(--panel2)}
+ .sw{display:inline-flex;align-items:center;gap:6px;cursor:pointer}
+ details pre{background:var(--panel2);padding:12px;max-height:260px;overflow:auto;white-space:pre-wrap;border-radius:10px;font:12px/1.45 var(--mono)}
+ summary{cursor:pointer;padding:8px 2px;font:12px var(--mono);color:var(--dim)}
+ .rng{display:grid;grid-template-columns:92px 1fr 46px;gap:12px;align-items:center;margin:9px 0} .rng b{text-align:right;font-family:var(--mono)}
+ #camWrap{display:none;position:relative;resize:both;overflow:hidden;width:min(100%,760px);height:428px;min-width:260px;min-height:160px;max-width:100%;
+  background:#000;border-radius:14px;margin:0 auto;border:1px solid var(--line);box-shadow:var(--shadow)}
+ #camBox{position:absolute;inset:0} #camBox video{object-fit:contain !important}
+ #camBar{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+ #camMsg{min-height:18px;margin-top:10px;text-align:center}
+ footer{margin-top:26px;padding-top:14px;border-top:1px solid var(--line);font:12px var(--mono);color:var(--dim);display:flex;gap:14px;flex-wrap:wrap;justify-content:space-between}
+
+ .posbox{margin-left:auto;display:grid;gap:6px;min-width:170px;padding:12px 16px;border:1px solid var(--line);border-radius:12px;background:var(--panel2)}
+ .posbox>div:not(.k){display:flex;justify-content:space-between;gap:18px;font:16px var(--mono)}
+ .rangeb{display:inline-flex;gap:6px;align-items:center}
+ .graphs{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,460px),1fr));gap:18px}
+ .gbox{position:relative} .gbox canvas{width:100%;height:180px;display:block}
+ .legend{display:flex;gap:14px;flex-wrap:wrap;font:12px var(--mono);margin-bottom:6px}
+ .legend i{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:5px;vertical-align:-1px}
+ .tip{position:absolute;top:6px;pointer-events:none;display:none;padding:6px 9px;border-radius:8px;background:var(--panel);border:1px solid var(--line);font:11px/1.5 var(--mono);white-space:nowrap;z-index:3;box-shadow:var(--shadow)}
+ .console{max-height:300px;overflow:auto;background:var(--panel2);border-radius:10px;padding:8px 12px;font:12px/1.7 var(--mono)}
+ .cl{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap}
+ .cl .ct,.cl .cd{color:var(--dim)} .cl .cs{font-size:10px;border:1px solid var(--line);border-radius:6px;padding:0 6px;color:var(--dim)}
+ .cl .cr{margin-left:auto;color:var(--ok)} .cl.bad .cr{color:var(--bad)}
+ .pager{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-top:14px}
+ #app button.pg{min-width:32px;padding:3px 9px}
+
+ .modalbg{position:fixed;inset:0;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;padding:16px;z-index:50}
+ .modal{background:var(--panel);color:var(--text);border:1px solid var(--line);border-radius:var(--radius);box-shadow:0 20px 60px rgba(0,0,0,.5);max-width:640px;width:100%;max-height:86vh;overflow:auto;padding:16px 20px}
+ .mhead{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;font-size:15px}
+ .helpbody ol{margin:4px 0 10px;padding-left:22px}
+ .helpbody li{margin:6px 0;line-height:1.5}
+ .helpbody code{font-family:var(--mono);background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:0 5px}
+ /* Orca injects <style id="orca-plugin-defaults"> after this one (html/body colours, headings, button, input/select,
+    th/td). Equal-specificity rules would lose to it, so the base elements are restated with higher specificity. */
+ :root,:root body{background:var(--bg) var(--bgimg) fixed;color:var(--text);font-family:var(--sans);font-size:13px}
+ :root[data-theme="simple-dark"],:root[data-theme="0x"],:root{color-scheme:dark}
+ :root[data-theme="simple-light"]{color-scheme:light}
+ #app h1,#app h2,#app h3,#app h4{color:var(--text);font-weight:650}
+ #app button{font:inherit;font-weight:500;background:var(--panel2);color:var(--text);border:1px solid var(--line);border-radius:10px;padding:5px 13px;filter:none}
+ #app button:hover:not(:disabled){border-color:var(--acc);filter:none}
+ #app button:disabled{opacity:.4;cursor:not-allowed}
+ #app button.pri{background:var(--acc);border-color:var(--acc);color:var(--onacc)}
+ #app button.pri:hover:not(:disabled){background:var(--acc2);border-color:var(--acc2)}
+ #app button.dng{background:transparent;color:var(--bad);border-color:var(--bad)}
+ #app button.dng:hover:not(:disabled){background:var(--bad);color:#fff}
+ #app button.sel{background:var(--acc);border-color:var(--acc);color:var(--onacc)}
+ #app button.ico{padding:3px 8px}
+ #app .pad button,#app .zcol button{padding:0}
+ #app .zcol.hall button{padding:8px 16px}
+ #app input,#app select,#app textarea{font:inherit;background:var(--panel2);color:var(--text);border:1px solid var(--line);border-radius:10px;padding:4px 9px}
+ #app input[type=checkbox],#app input[type=range]{padding:0;background:transparent;border:0}
+ #app input:focus,#app select:focus{outline:none;border-color:var(--acc)}
+ #app table{border-collapse:collapse}
+ #app th,#app td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--line)}
+ #app th{color:var(--dim);font-weight:500}
+ ::-webkit-scrollbar-thumb{background:var(--line)}
+</style>
+
+<div id="app">
+<div id="note"></div>
+<div class="top">
+  <svg width="46" height="46" viewBox="0 0 128 128" aria-hidden="true"><rect width="128" height="128" rx="26" style="fill:var(--acc)"/><path transform="translate(0 4)" d="M40 58a15 15 0 0 1 14-20 20 20 0 0 1 37 6 13 13 0 0 1-1 26H44a12 12 0 0 1-4-12z" fill="#fff3e8"/><rect x="34" y="66" width="60" height="44" rx="5" fill="none" stroke="#fff" stroke-width="5"/><line x1="34" y1="80" x2="94" y2="80" stroke="#fff" stroke-width="4"/><rect x="58" y="76" width="12" height="9" rx="2" fill="#ffd2b0"/><path d="M61 85h6l-3 6z" fill="#ffd2b0"/></svg>
+  <div><div class="name" id="pname">Elegoo CC2</div><div class="mut" id="pinfo"></div></div>
+  <div class="right">
+    <div class="chips"><span class="chip" id="cRtm">RTM: starting</span><span class="chip" id="cPr">Printer: -</span><span class="chip" id="cSt">-</span></div>
+    <div class="themebar"><button id="bGuide" title="How to print from Orca">Guide</button><span>theme</span>
+      <select id="thTheme" title="Colour theme"><option value="simple-dark">Simple dark</option><option value="simple-light">Simple white</option><option value="0x">0xpraet0rian</option></select></div>
+  </div>
+</div>
+
+<div class="card" id="acct" style="margin-bottom:12px">
+  <h3>Account <span class="mut" id="aSub"></span></h3>
+  <div id="aOut" style="display:none">
+    <div class="row">You are not signed in to the Elegoo cloud.</div>
+    <div class="row"><button class="pri" id="bSign">Sign in with Elegoo</button>
+      <button id="bImport" title="Reuse the session of the ElegooSlicer installed on this PC (token only, read once)">Use ElegooSlicer session</button></div>
+    <div class="mut">Sign-in opens Elegoo's own page in your browser, served through a local connection on this PC. The plugin passes your password to Elegoo in memory only: it is never stored or logged. Only the session Elegoo returns is kept (encrypted).</div>
+  </div>
+  <div id="aIn" style="display:none">
+    <div class="row"><span>Signed in as <b id="aMail"></b></span><span class="mut" id="aSrc"></span><span class="chip" id="aLink">cloud link: offline</span></div>
+    <div class="row"><span>Printer</span><select id="aDev"></select>
+      <button class="pri" id="bConn">Connect via cloud</button><button id="bOut" class="dng">Log out</button></div>
+    <div class="row"><label class="sw"><input type="checkbox" id="aAuto"> Connect automatically</label><span id="aStat" class="mut"></span></div>
+    <div class="mut">Close ElegooSlicer while connected: the Elegoo account allows one cloud session. LAN mode is not supported yet.</div>
+  </div>
+</div>
+
+<div id="guideBg" class="modalbg" style="display:none"><div class="modal" role="dialog" aria-label="How to print from Orca">
+  <div class="mhead"><b>How to print from Orca</b><button id="gClose" class="ico" title="Close">&#10005;</button></div>
+  <div class="helpbody">
+    <ol>
+      <li><b>Sign in</b> above and wait for <i>cloud link: online</i>. Keep this tab open while you print: it holds the connection to the printer.</li>
+      <li><b>One-time setup in Orca.</b> In the Printer panel add a <i>physical printer</i> (icon next to the printer name):
+        Host Type <b>Elegoo Link</b>, Hostname <code>127.0.0.1:47890</code>, API key empty. Press <i>Test</i>; it should succeed. Select that printer.</li>
+      <li><b>Slice</b> your plate, then press Orca's <b>Print</b> button.</li>
+      <li>The file goes to the Elegoo cloud and the printer downloads it. Orca stays at about 99% for one to two minutes while this happens; that is normal.</li>
+      <li>When the download is done the plugin <b>starts the print by itself</b> and matches each colour to a filament slot by type (PLA to a PLA slot). Progress is in <i>Command console</i>.
+        Turn this off with <i>Start after Orca upload</i> in the Files bar; then press <i>Print</i> on the file in <i>Printer files</i> to choose slots yourself.</li>
+    </ol>
+    <div class="mut"><b>Other ways in:</b> <i>Send G-code...</i> (Files bar) uploads a <code>.gcode</code> or <code>.gcode.3mf</code> you pick, without Orca's Print button.
+      Files already on the printer start from <i>Printer files</i>.</div>
+    <div class="mut" style="margin-top:6px"><b>If it fails:</b> check <i>Command console</i> for the failing step. &quot;Another session&quot; means ElegooSlicer or an old tab is still connected;
+      &quot;offline in the cloud&quot; means the printer is off or has no Wi-Fi. Close ElegooSlicer while this plugin is connected.</div>
+  </div>
+</div></div>
+
+<div id="ctlHint" class="mut" style="margin:4px 2px 10px">Connect to the Elegoo cloud (Account above) to see and control the printer.</div>
+<div class="cols off" id="ctl">
+  <div class="split">
+  <div class="col">
+  <div class="card" id="cPrint">
+    <h3>Print <span class="mut" id="pFile"></span></h3>
+    <div class="bar"><i id="pBar"></i></div>
+    <div class="kv">
+      <div><span class="k">Progress</span><span class="v" id="vPg">-</span></div>
+      <div><span class="k">Layer</span><span class="v" id="vLy">-</span></div>
+      <div><span class="k">Elapsed</span><span class="v" id="vEl">-</span></div>
+      <div><span class="k">Remaining</span><span class="v" id="vLf">-</span></div>
+    </div>
+    <div class="row">
+      <button id="bPause">Pause</button><button id="bResume">Resume</button><button id="bStop" class="dng">Stop</button>
+    </div>
+    <div class="row"><span class="mut" style="width:70px">Speed</span>
+      <select id="sSpeed"><option value="0">Silent</option><option value="1">Balanced</option><option value="2">Sport</option><option value="3">Ludicrous</option></select>
+    </div>
+    <div id="cfmStop" class="panel" style="display:none">Stop the running print? <button id="yStop" class="dng">Yes, stop</button> <button id="nStop">No</button></div>
+  </div>
+
+  <div class="card">
+    <h3>Motion</h3>
+    <div class="row"><span class="mut">Step</span>
+      <span class="tabs" id="steps"><button data-s="0.1">0.1</button><button data-s="1">1</button><button data-s="10" class="sel">10</button><button data-s="30">30</button><span class="mut">mm</span></span></div>
+    <div class="row" style="gap:18px;align-items:flex-start">
+      <div class="pad">
+        <span></span><button data-mv="y+">Y+</button><span></span>
+        <button data-mv="x-">X-</button><button id="bHxy" title="Home X and Y">XY</button><button data-mv="x+">X+</button>
+        <span></span><button data-mv="y-">Y-</button><span></span>
+      </div>
+      <div class="zcol"><button data-mv="z+" title="Increase Z">Z+</button><button id="bHz" title="Home Z">Z</button><button data-mv="z-" title="Decrease Z">Z-</button></div>
+      <div class="zcol hall"><button id="bHall" title="Home all axes">Home all</button></div>
+      <div class="posbox"><div class="k">Position (mm)</div><div><span class="mut">X</span><b id="pX">-</b></div><div><span class="mut">Y</span><b id="pY">-</b></div><div><span class="mut">Z</span><b id="pZ">-</b></div></div>
+    </div>
+    <div class="mut" id="homedNote"></div>
+  </div>
+
+  <div class="card" style="grid-column:1/-1">
+    <h3>Command console <span><button id="bConClear">Clear</button></span></h3>
+    <div class="console" id="console"><span class="mut">Every command sent to the printer shows up here: motion, temperatures, fans, light, speed, filament, files and prints.</span></div>
+  </div>
+  </div>
+  <div class="col">
+  <div class="card">
+    <h3>Temperature <span class="rangeb"><button data-r="300000">5 min</button><button data-r="1800000" class="sel">30 min</button><button data-r="7200000">2 h</button><button class="gclear" title="Forget the recorded points">Clear</button></span></h3>
+    <div class="row"><span style="width:70px">Nozzle</span><b id="tNz">-</b><span class="mut">/</span><input type="number" id="iNz" min="0" max="350" placeholder="0"><button id="bNz">Set</button><button id="bNz0">Off</button></div>
+    <div class="row"><span style="width:70px">Bed</span><b id="tBd">-</b><span class="mut">/</span><input type="number" id="iBd" min="0" max="120" placeholder="0"><button id="bBd">Set</button><button id="bBd0">Off</button></div>
+    <div class="row"><span style="width:70px">Chamber</span><b id="tCh">-</b></div>
+    <div class="legend" id="lgT" style="margin-top:10px"></div><div class="gbox"><canvas id="cT"></canvas><div class="tip" id="tipT"></div></div>
+    <div class="mut" style="margin-top:6px;font-size:12px">Recorded while the printer is connected; kept while Orca is running.</div>
+  </div>
+
+  <div class="card">
+    <h3>Fans and light <span class="rangeb"><button data-r="300000">5 min</button><button data-r="1800000" class="sel">30 min</button><button data-r="7200000">2 h</button><button class="gclear" title="Forget the recorded points">Clear</button></span></h3>
+    <div class="rng"><span>Model</span><input type="range" id="fModel" min="0" max="100" step="5"><b id="vModel">0%</b></div>
+    <div class="rng"><span>Assistance</span><input type="range" id="fAux" min="0" max="100" step="5"><b id="vAux">0%</b></div>
+    <div class="rng"><span>Case</span><input type="range" id="fCase" min="0" max="100" step="5"><b id="vCase">0%</b></div>
+    <div class="row"><label class="sw"><input type="checkbox" id="light"> Overhead light</label></div>
+    <div class="legend" id="lgF" style="margin-top:10px"></div><div class="gbox"><canvas id="cF"></canvas><div class="tip" id="tipF"></div></div>
+  </div>
+  </div>
+  </div>
+
+  <div class="card" style="grid-column:1/-1">
+    <h3>Camera <span id="camBar"><label class="sw" title="Start the camera by itself when the printer connects"><input type="checkbox" id="camAuto"> Auto-start</label> <span class="tabs" id="camSizes" style="display:none"><button data-w="360">S</button><button data-w="560">M</button><button data-w="800">L</button><button data-w="0" title="Fit the card width">Fit</button><button id="bFull" title="Full screen">Full screen</button></span> <button id="bCam" class="pri">Turn on</button></span></h3>
+    <div id="camWrap" title="Drag the bottom-right corner to resize"><div id="camBox"></div></div>
+    <div class="mut" id="camMsg">Live view from the printer camera (needs the cloud account; one viewer per account). Drag the bottom-right corner of the picture to resize it.</div>
+  </div>
+
+  <div class="card" style="grid-column:1/-1">
+    <h3>Filament <span><label class="sw"><input type="checkbox" id="autoRefill"> Auto refill</label> <button id="bCanvas" class="ico" title="Reload filament slots (also automatic)">&#8635;</button></span></h3>
+    <div class="slots" id="slots"><span class="mut">Reading the filament slots...</span></div>
+    <div class="row"><button id="bLoad">Load</button><button id="bUnload">Unload</button><span class="mut">Select a slot first.</span>
+      <span style="margin-left:auto" class="mut">Extruder:</span><button id="bFeed">Feed</button><button id="bRetreat">Retract</button></div>
+  </div>
+
+  <div class="card" style="grid-column:1/-1">
+    <div class="toolbar"><div class="tabs"><button id="tFiles" class="sel">Printer files</button><button id="tHist">Print history</button></div><span style="display:flex;gap:8px;align-items:center"><label class="sw" title="When Orca uploads a file with Print, start it on the printer by itself (filament slots are matched by type)"><input type="checkbox" id="autoPrint"> Start after Orca upload</label><button id="bSend" title="Pick a .gcode exported from Orca and upload it to the printer">Send G-code...</button><button id="bFiles" class="ico" title="Reload (also automatic)">&#8635;</button></span></div>
+    <div id="startPanel" class="panel" style="display:none"></div>
+    <div id="fileBox"><span class="mut">Reading the file list...</span></div>
+  </div>
+</div>
+
+<details style="margin-top:12px"><summary class="mut">Log</summary><pre id="log"></pre></details>
+
+<footer><span>plugin by <a data-open="https://0xpraet0rian.github.io/">0xpraet0rian</a> &middot; <a data-open="https://github.com/0xpraet0rian">GitHub &#8599;</a> &middot; <a data-open="https://0xpraet0rian.github.io/">portfolio &#8599;</a></span><span>elegoo cc2 cloud &middot; v0.3</span></footer>
+</div>
+
+<script>
+// The page lives on an opaque origin inside Orca: localStorage/sessionStorage throw. Give the SDK in-memory ones.
+(function(){
+  function mem(){ const m=new Map(); return {
+    getItem:k=>m.has(String(k))?m.get(String(k)):null, setItem:(k,v)=>{m.set(String(k),String(v));},
+    removeItem:k=>{m.delete(String(k));}, clear:()=>m.clear(), key:i=>Array.from(m.keys())[i]??null,
+    get length(){return m.size;} }; }
+  for(const n of ['localStorage','sessionStorage']){
+    let ok=true;
+    try{ const store=window[n]; const key='__cc2_storage_test__'; store.setItem(key,'1'); store.removeItem(key); }
+    catch(e){ ok=false; }
+    if(!ok){ try{ Object.defineProperty(window,n,{value:mem(),configurable:true}); }catch(e){} }
+  }
+})();
+</script>
+<script>
+const CC2_LINUX=__CC2_LINUX__;
+const $=id=>document.getElementById(id); const dec=new TextDecoder();
+let rtm=null, C=null, GEN=0, off=null;
+function P(o){ try{ orca.postMessage(o);}catch(e){ L('bridge error '+e);} }
+function L(s){ const l=$('log'); l.textContent+=s+'\n'; l.scrollTop=l.scrollHeight; }
+
+const AGORA_SDK={
+  AgoraRTM:'https://cdn.jsdelivr.net/npm/agora-rtm@2.3.0/agora-rtm.js',
+  AgoraRTC:'https://cdn.jsdelivr.net/npm/agora-rtc-sdk-ng@4.22.0/AgoraRTC_N-production.js'
+};
+const sdkLoads={};
+function loadAgora(name){
+  if(window[name]) return Promise.resolve(window[name]);
+  if(!sdkLoads[name]){
+    const load=url=>new Promise((resolve,reject)=>{
+      const script=document.createElement('script');
+      const finish=()=>{
+        clearTimeout(timer);
+        script.remove();
+        if(window[name]) resolve(window[name]); else reject(new Error(name+' SDK unavailable. Check HTTPS access to cdn.jsdelivr.net.'));
+      };
+      const timer=setTimeout(finish,12000);
+      script.onload=script.onerror=finish;
+      script.src=url;
+      document.head.appendChild(script);
+    });
+    sdkLoads[name]=load(AGORA_SDK[name]).catch(()=>load(AGORA_SDK[name]+'?cc2-retry='+Date.now()))
+      .finally(()=>{ delete sdkLoads[name]; });
+  }
+  return sdkLoads[name];
+}
+
+/* ---------- RTM transport (unchanged protocol) ---------- */
+window.addEventListener('pagehide',()=>{ try{ if(rtm) rtm.logout(); }catch(e){} });
+async function drop(){
+  if(off){ try{off();}catch(e){} off=null; }
+  if(rtm){ try{ await rtm.logout(); }catch(e){} rtm=null; }
+}
+async function doLogin(cfg,gen){
+  C=cfg; GEN=gen; setChip('cRtm','RTM: logging in','warn');
+  try{
+    await drop();
+    const {RTM}=await loadAgora('AgoraRTM');
+    if(gen!==GEN) return;
+    const r=new RTM(cfg.appId,cfg.rtmUserId,{presenceTimeout:15,heartbeatInterval:5});
+    const onStatus=e=>{ if(gen!==GEN) return; setChip('cRtm','RTM: '+String(e.state).toLowerCase(), String(e.state)==='CONNECTED'?'ok':'warn'); P({type:'rtm_status',gen,state:e.state,reason:e.reason}); };
+    const onExp=()=>{ if(gen===GEN) P({type:'token_expiring',gen}); };
+    const printer=cfg.userId+cfg.sn;
+    const onMsg=e=>{ if(gen!==GEN || e.publisher!==printer) return; let t=e.message; if(typeof t!=='string') t=dec.decode(t); P({type:'msg',gen,text:t}); };
+    r.addEventListener('status',onStatus); r.addEventListener('tokenPrivilegeWillExpire',onExp); r.addEventListener('message',onMsg);
+    off=()=>{ r.removeEventListener('status',onStatus); r.removeEventListener('tokenPrivilegeWillExpire',onExp); r.removeEventListener('message',onMsg); };
+    rtm=r;
+    await r.login({token:cfg.rtmToken});
+    await r.subscribe(cfg.userId,{withMessage:true,withPresence:true});
+    setChip('cRtm','RTM: online','ok'); P({type:'login_ok',gen});
+  }catch(e){ setChip('cRtm','RTM: error','bad'); P({type:'login_err',gen,error:(e&&e.message)||JSON.stringify(e)}); }
+}
+
+/* ---------- UI helpers ---------- */
+function setChip(id,text,cls){ const e=$(id); e.textContent=text; e.className='chip '+(cls||''); }
+let noteT=null;
+function note(text,kind){ const n=$('note'); n.textContent=text; n.className=kind||''; n.style.display='block'; clearTimeout(noteT); noteT=setTimeout(()=>{n.style.display='none';},kind==='bad'?9000:3500); }
+let RID=0; const WAIT={};
+async function locked(fn){ BUSY=true; applyStatus(S); try{ return await fn(); } finally{ BUSY=false; applyStatus(S); } }
+function call(method,params,ms){ return new Promise((res,rej)=>{ const rid=++RID; const t=setTimeout(()=>{delete WAIT[rid];rej(new Error('timeout'));},ms||45000); WAIT[rid]={res,rej,t}; P({type:'cmd',rid,method,params:params||{}}); }); }
+async function run(label,method,params,ms){ try{ const r=await call(method,params,ms); if(label) note(label,'ok'); return r; }catch(e){ note((label||String(method))+' failed: '+e.message,'bad'); throw e; } }
+const fmtT=m=>{ if(!m) return '-'; const h=Math.floor(m/60), mm=Math.round(m%60); return h?h+' h '+mm+' min':mm+' min'; };
+const fmtS=s=>{ if(!s) return '-'; const m=Math.round(s/60); return fmtT(m); };
+const fmtMB=b=>b?(b/1048576).toFixed(b<1048576*10?2:1)+' MB':'-';
+const fmtD=t=>{ if(!t) return '-'; const d=new Date((t>1e12?t:t*1000)); return isNaN(d)?'-':d.toISOString().slice(0,16).replace('T',' '); };
+const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const col=s=>/^#?[0-9a-f]{3,8}$/i.test(String(s||''))?(String(s)[0]==='#'?String(s):'#'+s):'#ddd';
+const num=v=>(+v)|0;
+
+/* ---------- live state ---------- */
+let FIRST=true;
+function autoHooks(prev,m){
+  if(FIRST){ FIRST=false; setTimeout(()=>{ loadCanvas(true); refresh(true); },400); if(PREFS.cam!==false) setTimeout(()=>{ if(!CAMON&&!$('bCam').disabled) camStart(); },1500); }
+  if(prev&&prev.code===2&&m.code!==2) setTimeout(()=>{ refresh(true); loadCanvas(true); },2500);   // a print just ended
+  if(prev&&prev.code!==1&&m.code===1) setTimeout(()=>loadCanvas(true),1500);                       // back to idle (filament ops etc.)
+}
+let S={code:null,state:'IDLE',homed:'',online:false}; let STEP=10, dragging=null, BUSY=false;
+const active=m=>m.code===2&&m.sub!==2077&&m.sub!==2504;
+function applyStatus(m){
+  autoHooks(S,m);
+  S=m; const idle=(m.code===1)&&!BUSY, printing=active(m), paused=(m.state==='PAUSE');
+  $('cSt').textContent=m.label||m.state; $('cSt').className='chip '+(printing?'ok':(m.code===14?'bad':''));
+  $('pFile').textContent=m.file||''; $('pBar').style.width=Math.min(100,m.progress||0)+'%';
+  $('vPg').textContent=(m.progress||0)+'%'; $('vLy').textContent=m.total?(m.layer+' / '+m.total):'-'; $('vLf').textContent=fmtT(m.left); $('vEl').textContent=fmtS(m.elapsed);
+  $('tNz').textContent=Math.round(m.nozzle)+' C'; $('tBd').textContent=Math.round(m.bed)+' C'; $('tCh').textContent=Math.round(m.chamber)+' C';
+  if(document.activeElement!==$('iNz')) $('iNz').placeholder=Math.round(m.nozzle_t||0); if(document.activeElement!==$('iBd')) $('iBd').placeholder=Math.round(m.bed_t||0);
+  $('pX').textContent=(+m.x).toFixed(1); $('pY').textContent=(+m.y).toFixed(1); $('pZ').textContent=(+m.z).toFixed(1);
+  $('homedNote').textContent=m.homed?('Homed axes: '+m.homed.toUpperCase()):'Not homed: home the axes before moving.';
+  for(const [id,k,lab] of [['fModel','model','vModel'],['fAux','aux','vAux'],['fCase','case','vCase']]){
+    const rep=m[k+'_fan'], hd=HOLD[id], now=Date.now(), pending=!!hd&&now<hd.until&&rep!==hd.v;
+    if(hd&&(rep===hd.v||now>=hd.until)) delete HOLD[id];
+    if(dragging!==id) $(id).value=pending?hd.v:rep;
+    $(lab).textContent=Math.round($(id).value)+'%'+(pending?'\u2026':''); $(lab).title='Reported by the printer: '+rep+'%';
+  }
+  { const hl=HOLD.light, now=Date.now(), rep=!!m.light, pend=!!hl&&now<hl.until&&rep!==!!hl.v; if(hl&&(rep===!!hl.v||now>=hl.until)) delete HOLD.light; if(dragging!=='light') $('light').checked=pend?!!hl.v:rep; }
+  if(document.activeElement!==$('sSpeed')) $('sSpeed').value=String(m.speed);
+  const canPause=printing&&!paused, canResume=paused;
+  $('bPause').disabled=!canPause; $('bResume').disabled=!canResume; $('bStop').disabled=!(printing||paused);
+  document.querySelectorAll('[data-mv],#bHxy,#bHz,#bHall').forEach(b=>b.disabled=!idle);
+  $('bNz').disabled=$('bBd').disabled=!(m.code===1||printing||m.code===13);
+  $('bNz0').disabled=$('bBd0').disabled=!(m.code===1||m.code===13);
+  $('bLoad').disabled=$('bUnload').disabled=$('bFeed').disabled=$('bRetreat').disabled=!idle;
+}
+
+/* ---------- messages from Python ---------- */
+async function handle(m){
+  if(!m) return;
+  if(m.type==='login') doLogin(m.cfg,m.gen);
+  else if(m.type==='logout'){ GEN++; await drop(); setChip('cRtm','RTM: logged out',''); }
+  else if(m.type==='renew' && rtm){ try{ await rtm.renewToken(m.token);}catch(e){ L('renew '+e);} }
+  else if(m.type==='publish'){
+    if(m.deadline && Date.now()/1000>m.deadline){ L('dropped an expired command'); return; }
+    if(!rtm||!C){ P({type:'publish_err',id:m.id,error:'RTM not logged in'}); return; }
+    try{ await rtm.publish(C.userId+C.sn,m.text,{channelType:'USER',customType:'PlainText'}); }
+    catch(e){ P({type:'publish_err',id:m.id,error:(e&&e.message)||JSON.stringify(e)}); }
+  }
+  else if(m.type==='log') L(m.line);
+  else if(m.type==='logs') (m.lines||[]).forEach(L);
+  else if(m.type==='info'){ $('pname').textContent=m.name||'Elegoo CC2'; $('pinfo').textContent=[m.model,'firmware '+(m.fw||'?'),'LAN IP '+(m.ip||'?'),'SN '+(m.sn||'?')].join('  |  '); }
+  else if(m.type==='note'){ note(m.text,m.kind); }
+  else if(m.type==='samples'){ for(const s of (m.items||[])) SAMPLES.push(s); if(SAMPLES.length>1800) SAMPLES.splice(0,SAMPLES.length-1800); scheduleDraw(); }
+  else if(m.type==='cmdlog'){ (m.items||[]).forEach(addCmd); }
+  else if(m.type==='prefs'){ PREFS={theme:m.theme||'simple-dark',cam:m.cam!==false,autostart:m.autostart!==false}; applyTheme(); }
+  else if(m.type==='connstat'){ const e=$('aStat'); e.textContent=m.text; e.style.color=m.kind==='bad'?'var(--bad)':(m.kind==='ok'?'var(--ok)':''); }
+  else if(m.type==='account'){ renderAccount(m); }
+  else if(m.type==='conn'){ setChip('cPr','Printer: '+(m.printer?'online':'offline'),m.printer?'ok':'bad'); if(m.msg) note(m.msg,m.printer?'ok':'bad'); if(!m.printer){ $('ctl').classList.add('off'); $('ctlHint').style.display='block'; $('aStat').textContent=m.msg||'Printer is offline in the Elegoo cloud'; $('aStat').style.color='var(--bad)'; } }
+  else if(m.type==='status'){ setChip('cPr','Printer: online','ok'); $('ctl').classList.remove('off'); $('ctlHint').style.display='none'; applyStatus(m); }
+  else if(m.type==='cmd_result'){ const w=WAIT[m.rid]; if(!w) return; clearTimeout(w.t); delete WAIT[m.rid]; m.ok?w.res(m.result):w.rej(new Error(m.error)); }
+  else if(m.type==='batch'){ for(const it of (m.items||[])) await handle(it); }
+}
+orca.onMessage(handle);
+setInterval(()=>P({type:'pull'}),300);
+
+/* ---------- controls ---------- */
+/* ---------- theme, links ---------- */
+let PREFS={theme:'simple-dark',cam:true,autostart:true};
+function applyTheme(){ const t=['simple-dark','simple-light','0x'].includes(PREFS.theme)?PREFS.theme:'simple-dark'; document.documentElement.dataset.theme=t; $('thTheme').value=t; $('camAuto').checked=PREFS.cam!==false; $('autoPrint').checked=PREFS.autostart!==false; try{ scheduleDraw(); }catch(e){} }
+$('bGuide').onclick=()=>{ $('guideBg').style.display='flex'; };
+$('gClose').onclick=()=>{ $('guideBg').style.display='none'; };
+$('guideBg').addEventListener('click',e=>{ if(e.target===$('guideBg')) $('guideBg').style.display='none'; });
+document.addEventListener('keydown',e=>{ if(e.key==='Escape') $('guideBg').style.display='none'; });
+$('thTheme').onchange=()=>{ PREFS.theme=$('thTheme').value; applyTheme(); call('prefs_set',PREFS).catch(()=>{}); };
+$('autoPrint').onchange=()=>{ PREFS.autostart=$('autoPrint').checked; call('prefs_set',PREFS).catch(()=>{}); };
+$('camAuto').onchange=()=>{ PREFS.cam=$('camAuto').checked; call('prefs_set',PREFS).catch(()=>{}); };
+applyTheme();
+document.addEventListener('click',e=>{ const a=e.target.closest&&e.target.closest('[data-open]'); if(a){ e.preventDefault(); call('open_url',{url:a.dataset.open}).catch(()=>note('Could not open the link','bad')); } });
+
+/* ---------- account ---------- */
+let ACC=null;
+function renderAccount(a){
+  if(!a.rtm) FIRST=true;
+  ACC=a; $('aOut').style.display=a.logged?'none':'block'; $('aIn').style.display=a.logged?'block':'none';
+  if(!a.logged){ return; }
+  $('aMail').textContent=a.email||a.nickname||'(account)'; $('aSrc').textContent=a.source==='imported'?'(session imported from ElegooSlicer)':'';
+  const sel=$('aDev'); sel.innerHTML=(a.devices||[]).map(d=>'<option value="'+esc(d.sn)+'"'+(d.sn===a.sn?' selected':'')+'>'+esc(d.name)+' ('+esc(d.sn)+')</option>').join('');
+  const on=a.rtm; $('aLink').textContent='cloud link: '+(on?'online':'offline'); $('aLink').className='chip '+(on?'ok':'');
+  $('aAuto').checked=a.auto!==false; if(!on){ $('ctl').classList.add('off'); $('ctlHint').style.display='block'; }
+}
+async function loadAccount(){ try{ renderAccount(await call('acct_status')); }catch(e){ note('Account: '+e.message,'bad'); } }
+$('bSign').onclick=()=>run('Sign-in page opened in your browser','acct_login').catch(()=>{});
+$('bImport').hidden=CC2_LINUX;
+$('bImport').onclick=()=>run('Session imported','acct_import').then(renderAccount).catch(()=>{});
+$('bOut').onclick=()=>run('Signed out','acct_logout').then(renderAccount).catch(()=>{});
+$('aDev').onchange=e=>run('Printer selected','acct_select',{sn:e.target.value}).then(renderAccount).catch(()=>{});
+$('bConn').onclick=()=>run(null,'acct_connect',{},90000).then(renderAccount).catch(()=>{});
+$('aAuto').onchange=e=>run(null,'acct_auto',{on:e.target.checked}).catch(()=>{});
+$('bPause').onclick=()=>run('Paused',1021).catch(()=>{});
+$('bResume').onclick=()=>run('Resumed',1023).catch(()=>{});
+$('bStop').onclick=()=>{ $('cfmStop').style.display='block'; };
+$('nStop').onclick=()=>{ $('cfmStop').style.display='none'; };
+$('yStop').onclick=()=>{ $('cfmStop').style.display='none'; run('Stopped',1022).catch(()=>{}); };
+$('sSpeed').onchange=e=>run('Speed set',1031,{mode:+e.target.value}).catch(()=>{});
+const setT=(key,id,v)=>run(key==='extruder'?'Nozzle target set':'Bed target set',1028,{[key]:v}).catch(()=>{});
+$('bNz').onclick=()=>{ const v=parseInt($('iNz').value); if(!(v>=0&&v<=350)) return note('Nozzle 0-350 C','bad'); setT('extruder','iNz',v); $('iNz').value=''; };
+$('bBd').onclick=()=>{ const v=parseInt($('iBd').value); if(!(v>=0&&v<=120)) return note('Bed 0-120 C','bad'); setT('heater_bed','iBd',v); $('iBd').value=''; };
+$('bNz0').onclick=()=>setT('extruder','iNz',0); $('bBd0').onclick=()=>setT('heater_bed','iBd',0);
+document.querySelectorAll('#steps button').forEach(b=>b.onclick=()=>{ STEP=+b.dataset.s; document.querySelectorAll('#steps button').forEach(x=>x.classList.toggle('sel',x===b)); });
+document.querySelectorAll('[data-mv]').forEach(b=>b.onclick=()=>{ const [ax,sg]=[b.dataset.mv[0],b.dataset.mv[1]]; run(null,1027,{axes:ax,distance:(sg==='-'?-1:1)*STEP}).catch(()=>{}); });
+$('bHxy').onclick=()=>locked(()=>run('Homing XY',1026,{homed_axes:'xy'},150000)).catch(()=>{});
+$('bHz').onclick=()=>locked(()=>run('Homing Z',1026,{homed_axes:'z'},150000)).catch(()=>{});
+$('bHall').onclick=()=>locked(()=>run('Homing all axes',1026,{homed_axes:'xyz'},180000)).catch(()=>{});
+const HOLD={};   // control id -> {v, until}: the value we just set, shown until the printer reports it (or 8 s pass)
+function holdSet(id,v){ HOLD[id]={v,until:Date.now()+8000}; }
+for(const [id,key,lab] of [['fModel','fan','vModel'],['fAux','aux_fan','vAux'],['fCase','box_fan','vCase']]){
+  const el=$(id);
+  el.oninput=()=>{ dragging=id; $(lab).textContent=el.value+'%'; };
+  el.onchange=()=>{ const pct=+el.value; holdSet(id,pct); run(null,1030,{[key]:Math.round(pct*255/100)}).catch(()=>{ delete HOLD[id]; }).finally(()=>{dragging=null;}); };
+}
+$('light').onchange=e=>{ const on=!!e.target.checked; dragging='light'; holdSet('light',on?1:0); run('Light '+(on?'on':'off'),1029,{power:on?1:0}).catch(()=>{ delete HOLD.light; }).finally(()=>{dragging=null;}); };
+
+/* ---------- camera (Agora RTC, same flow as ElegooSlicer: live/vp8, channel = printer serial) ---------- */
+let CAM=null, CAMON=false, PLAYING=false, SUBS=new Set(), CAMERR='';
+(function(){ try{ if(!navigator.mediaDevices){ navigator.mediaDevices={}; }
+  if(typeof navigator.mediaDevices.enumerateDevices!=='function') navigator.mediaDevices.enumerateDevices=()=>Promise.resolve([]);
+  if(typeof navigator.mediaDevices.getUserMedia!=='function') navigator.mediaDevices.getUserMedia=()=>Promise.reject(new Error('no capture devices')); }catch(e){} })();
+function camMsg(t,bad){ const e=$('camMsg'); e.textContent=t||''; e.style.color=bad?'var(--bad)':''; }
+const errText=e=>((e&&e.code)?e.code+': ':'')+((e&&e.message)||String(e));
+async function camStop(){
+  CAMON=false; PLAYING=false; SUBS.clear(); $('bCam').textContent='Turn on'; $('bCam').className='pri';
+  $('camWrap').style.display='none'; $('camSizes').style.display='none'; $('camBox').innerHTML='';
+  if(CAM){ const c=CAM; CAM=null; try{ c.removeAllListeners(); await c.leave(); }catch(e){} }
+}
+async function camStart(){
+  camMsg('Connecting to the camera...'); $('bCam').disabled=true; CAMERR=''; SUBS.clear(); PLAYING=false;
+  try{
+    const AgoraRTC=await loadAgora('AgoraRTC');
+    if(CC2_LINUX && (typeof RTCPeerConnection!=='function' || !AgoraRTC.checkSystemRequirements())){
+      camMsg('This WebView does not provide the WebRTC features required by Agora.',true); return;
+    }
+    const cfg=await call('cam_creds',{},30000);
+    try{ AgoraRTC.setLogLevel(3); AgoraRTC.disableLogUpload&&AgoraRTC.disableLogUpload(); }catch(e){}
+    const c=AgoraRTC.createClient({mode:'live',codec:'vp8'}); CAM=c;
+    // subscribe exactly once per remote user; transient subscribe errors are only logged, not shown
+    const show=async(u)=>{
+      if(SUBS.has(u.uid)) return; SUBS.add(u.uid);
+      try{ await c.subscribe(u,'video');
+        if(u.videoTrack){ $('camBox').innerHTML=''; $('camWrap').style.display='block'; $('camSizes').style.display='inline-flex'; u.videoTrack.play($('camBox'),{fit:'contain'}); PLAYING=true; camMsg('Live'); }
+      }catch(e){ SUBS.delete(u.uid); CAMERR=errText(e); L('camera subscribe: '+CAMERR); }
+    };
+    c.on('user-published',(u,m)=>{ if(m==='video') show(u); });
+    c.on('user-unpublished',(u)=>{ SUBS.delete(u.uid); PLAYING=false; camMsg('The stream stopped; waiting for the printer...'); });
+    c.on('connection-state-change',(a,b,r)=>{ L('camera link '+b+' -> '+a+(r?' ('+r+')':'')); if(a==='DISCONNECTED'&&CAMON) camMsg('Camera link lost',true); });
+    await c.join(cfg.appId,String(cfg.channel),cfg.token,Number(cfg.uid));
+    await c.setClientRole('host');
+    CAMON=true; $('bCam').textContent='Turn off'; $('bCam').className='';
+    for(let i=0;i<30&&CAMON&&!PLAYING;i++){ const u=c.remoteUsers.find(x=>x.hasVideo); if(u) await show(u); if(PLAYING) break; await new Promise(r=>setTimeout(r,1000)); }
+    if(CAMON&&!PLAYING) camMsg('No video from the printer'+(CAMERR?' ('+CAMERR+')':' (offline, or another viewer is connected)'),true);
+  }catch(e){ L('camera error: '+errText(e)); camMsg('Camera error: '+errText(e),true); await camStop(); }
+  finally{ $('bCam').disabled=false; }
+}
+$('bCam').onclick=()=>{ CAMON?camStop():camStart(); };
+document.querySelectorAll('#camSizes button[data-w]').forEach(b=>b.onclick=()=>{ const w=+b.dataset.w, el=$('camWrap'); el.style.width=w?w+'px':'100%'; el.style.height=Math.round((w||el.parentElement.clientWidth)*9/16)+'px'; });
+$('bFull').onclick=()=>{ const el=$('camWrap'); try{ (el.requestFullscreen||el.webkitRequestFullscreen).call(el); }catch(e){ note('Full screen is not available here','bad'); } };
+
+/* ---------- filament / canvas ---------- */
+let CANVAS=null, SEL=null;
+function renderCanvas(){
+  const box=$('slots'); box.innerHTML=''; if(!CANVAS){ box.innerHTML='<span class="mut">No canvas data.</span>'; return; }
+  const list=(CANVAS.canvas_list||[]).filter(c=>c.connected);
+  if(!list.length){ box.innerHTML='<span class="mut">No Canvas connected.</span>'; return; }
+  for(const c of list){ for(const t of (c.tray_list||[])){
+    const d=document.createElement('div'); const has=t.filament_type||t.filament_name; d.className='slot'+(has?'':' empty')+((SEL&&SEL.c===c.canvas_id&&SEL.t===t.tray_id)?' on':'');
+    d.innerHTML='<div class="dot" style="background:'+col(t.filament_color)+'"></div><b>'+esc(t.filament_type||'-')+'</b><small>'+(list.length>1?'C'+num(c.canvas_id)+' ':'')+'slot '+(num(t.tray_id)+1)+'</small>';
+    d.onclick=()=>{ SEL={c:c.canvas_id,t:t.tray_id}; renderCanvas(); };
+    box.appendChild(d);
+  } }
+  $('autoRefill').checked=!!CANVAS.auto_refill;
+}
+async function loadCanvas(silent){ try{ const r=await call('canvas',{},30000); CANVAS=r.canvas_info||null; renderCanvas(); }catch(e){ if(!silent) note('Canvas: '+e.message,'bad'); } }
+$('bCanvas').onclick=loadCanvas;
+$('bLoad').onclick=()=>{ if(!SEL) return note('Select a slot first','bad'); locked(()=>run('Loading filament',2001,{canvas_id:SEL.c,tray_id:SEL.t},330000)).then(loadCanvas).catch(()=>{}); };
+$('bUnload').onclick=()=>{ if(!SEL) return note('Select a slot first','bad'); locked(()=>run('Unloading filament',2002,{canvas_id:SEL.c,tray_id:SEL.t},330000)).then(loadCanvas).catch(()=>{}); };
+$('bFeed').onclick=()=>locked(()=>run('Feeding',1024,{},330000)).catch(()=>{});
+$('bRetreat').onclick=()=>locked(()=>run('Retracting',1025,{},330000)).catch(()=>{});
+$('autoRefill').onchange=e=>run('Auto refill '+(e.target.checked?'on':'off'),2004,{auto_refill:e.target.checked}).catch(()=>{});
+
+/* ---------- files and history ---------- */
+let TAB='files', FILES=[];
+$('tFiles').onclick=()=>{ TAB='files'; FP.page=1; $('tFiles').classList.add('sel'); $('tHist').classList.remove('sel'); refresh(); };
+$('tHist').onclick=()=>{ TAB='hist'; HP.page=1; $('tHist').classList.add('sel'); $('tFiles').classList.remove('sel'); refresh(); };
+$('bFiles').onclick=()=>refresh();
+$('bSend').onclick=async()=>{ const b=$('bSend'); b.disabled=true; const t=b.textContent; b.textContent='Sending...'; try{ const r=await call('send_local',{},960000); if(r&&r.name){ note('Sent '+r.name+' - press Print on it in the list','ok'); TAB='files'; $('tFiles').classList.add('sel'); $('tHist').classList.remove('sel'); refresh(); } }catch(e){ note('Send failed: '+e.message,'bad'); } finally{ b.disabled=false; b.textContent=t; } };
+async function refresh(silent){ if(!silent) $('startPanel').style.display='none'; if(TAB==='files') return loadFiles(silent); return loadHistory(silent); }
+setInterval(()=>{ if(S&&S.code!=null&&!document.hidden){ if(S.code===1) loadCanvas(true); refresh(true); } },60000);
+async function loadFiles(silent){
+  if(!silent||!FILES.length) $('fileBox').innerHTML='<span class="mut">Loading...</span>';
+  try{ const r=await call('files',{},120000); FILES=r.files||[]; if(TAB==='files') renderFiles(); }
+  catch(e){ if(!silent||!FILES.length) $('fileBox').innerHTML='<span class="mut">Could not load files: '+esc(e.message)+'</span>'; }
+}
+let SORTED=[], FP={page:1,size:10}, HP={page:1,size:10,total:0};
+function pager(id,total,page,size){
+  const pages=Math.max(1,Math.ceil(total/size)); page=Math.min(Math.max(1,page),pages);
+  const from=total?(page-1)*size+1:0, to=Math.min(total,page*size);
+  const lo=Math.max(1,Math.min(page-2,pages-4)), hi=Math.min(pages,lo+4), nums=[]; for(let i=lo;i<=hi;i++) nums.push(i);
+  const b=(p,label,dis,cls)=>'<button class="pg'+(cls?' '+cls:'')+'" data-pg="'+id+':'+p+'"'+(dis?' disabled':'')+'>'+label+'</button>';
+  return '<div class="pager">'+b(1,'&laquo;',page===1)+b(page-1,'&lsaquo;',page===1)+nums.map(n=>b(n,n,false,n===page?'sel':'')).join('')+b(page+1,'&rsaquo;',page===pages)+b(pages,'&raquo;',page===pages)+
+    '<span class="mut">'+from+'-'+to+' of '+total+'</span><select data-ps="'+id+'">'+[10,25,50].map(n=>'<option'+(n===size?' selected':'')+'>'+n+'</option>').join('')+'</select><span class="mut">per page</span></div>';
+}
+function renderFiles(){
+  if(!FILES.length){ $('fileBox').innerHTML='<span class="mut">No files on the printer.</span>'; return; }
+  SORTED=FILES.slice().sort((a,b)=>(b.create_time||0)-(a.create_time||0));
+  const pages=Math.max(1,Math.ceil(SORTED.length/FP.size)); FP.page=Math.min(Math.max(1,FP.page),pages);
+  const off=(FP.page-1)*FP.size;
+  const rows=SORTED.slice(off,off+FP.size).map((f,j)=>{
+    const i=off+j, dots=(f.color_map||[]).map(c=>'<i style="background:'+col(c.color)+'" title="T'+esc(c.t)+' '+esc(c.name)+'"></i>').join('');
+    return '<tr><td class="n" title="'+esc(f.filename)+'">'+esc(f.filename)+'</td><td>'+fmtMB(f.size)+'</td><td>'+esc(f.layer||'-')+'</td><td>'+fmtS(f.print_time)+'</td><td>'+(Number(f.total_filament_used)?Number(f.total_filament_used).toFixed(1)+' g':'-')+'</td><td class="dots">'+dots+'</td><td>'+fmtD(f.create_time)+'</td>'+
+      '<td style="white-space:nowrap"><button class="pri" data-p="'+i+'">Print</button> <button class="dng" data-d="'+i+'">Delete</button></td></tr>';
+  }).join('');
+  $('fileBox').innerHTML='<table><tr><th>File</th><th>Size</th><th>Layers</th><th>Time</th><th>Filament</th><th>Colours</th><th>Created</th><th></th></tr>'+rows+'</table>'+pager('f',SORTED.length,FP.page,FP.size);
+  $('fileBox').querySelectorAll('[data-p]').forEach(b=>b.onclick=()=>openStart(SORTED[+b.dataset.p]));
+  $('fileBox').querySelectorAll('[data-d]').forEach(b=>b.onclick=()=>askDelete(SORTED[+b.dataset.d]));
+}
+$('fileBox').addEventListener('click',e=>{ const b=e.target.closest&&e.target.closest('[data-pg]'); if(!b||b.disabled) return; const [id,pg]=b.dataset.pg.split(':'); if(id==='f'){ FP.page=+pg; renderFiles(); } else { HP.page=+pg; loadHistory(); } });
+$('fileBox').addEventListener('change',e=>{ const sel=e.target.closest&&e.target.closest('[data-ps]'); if(!sel) return; if(sel.dataset.ps==='f'){ FP.size=+sel.value; FP.page=1; renderFiles(); } else { HP.size=+sel.value; HP.page=1; loadHistory(); } });
+function askDelete(f){
+  PANEL++; const p=$('startPanel'); p.style.display='block';
+  p.innerHTML='Delete <b>'+esc(f.filename)+'</b> from the printer? <button class="dng" id="yDel">Yes, delete</button> <button id="nDel">No</button>';
+  $('nDel').onclick=()=>{p.style.display='none';};
+  $('yDel').onclick=async()=>{ p.style.display='none'; try{ await run('Deleted',1047,{storage_media:'local',file_path:[f.filename]}); loadFiles(); }catch(e){} };
+}
+let PANEL=0;
+async function openStart(f){
+  const my=++PANEL; const p=$('startPanel'); p.style.display='block'; p.innerHTML='Reading filament slots...';
+  await loadCanvas(); if(my!==PANEL) return;
+  const trays=[]; for(const c of ((CANVAS&&CANVAS.canvas_list)||[])){ if(!c.connected) continue; for(const t of (c.tray_list||[])) trays.push({c:c.canvas_id,t:t.tray_id,type:t.filament_type||'',color:t.filament_color||'',name:t.filament_name||''}); }
+  if(!trays.length){ p.style.display='none'; return note('No filament slot available (is the Canvas connected?)','bad'); }
+  const tools=(f.color_map&&f.color_map.length)?f.color_map:[{t:0,color:'',name:''}];
+  let html='<b>Print '+esc(f.filename)+'</b><div class="mut">Choose the slot for each filament in the file.</div>';
+  const used=new Set();
+  tools.forEach((tl,i)=>{
+    let guess=trays.findIndex((x,j)=>!used.has(j)&&x.type&&tl.name&&x.type.toUpperCase()===String(tl.name).toUpperCase());
+    if(guess<0) guess=trays.findIndex((x,j)=>!used.has(j));
+    if(guess>=0) used.add(guess);
+    html+='<div class="row"><span style="min-width:150px">T'+esc(tl.t)+' '+esc(tl.name||'')+' '+(tl.color?'<i style="display:inline-block;width:12px;height:12px;border-radius:50%;background:'+col(tl.color)+';border:1px solid #0003"></i>':'')+'</span><select data-t="'+esc(tl.t)+'">'+
+      trays.map((x,j)=>'<option value="'+j+'"'+(j===(guess>=0?guess:Math.min(i,trays.length-1))?' selected':'')+'>'+(trays.length>0&&CANVAS.canvas_list.filter(c=>c.connected).length>1?'C'+num(x.c)+' ':'')+'slot '+(num(x.t)+1)+' - '+esc(x.type||'empty')+'</option>').join('')+'</select></div>';
+  });
+  html+='<div class="row"><label class="sw"><input type="checkbox" id="chkLevel"> Auto bed leveling</label></div><div class="row"><button class="pri" id="yPrint">Start print</button> <button id="nPrint">Cancel</button></div>';
+  p.innerHTML=html; $('nPrint').onclick=()=>{p.style.display='none';};
+  $('yPrint').onclick=async()=>{
+    const slots=[...p.querySelectorAll('select[data-t]')].map(s=>({t:+s.dataset.t,canvas_id:trays[+s.value].c,tray_id:trays[+s.value].t}));
+    if(!slots.length||slots.some(s=>s.canvas_id===undefined)) return note('No filament slot available','bad');
+    p.style.display='none'; try{ await locked(()=>run('Print started','start_file',{filename:f.filename,slots,leveling:$('chkLevel')?$('chkLevel').checked:false},60000)); }catch(e){}
+  };
+}
+async function loadHistory(silent){
+  if(!silent) $('fileBox').innerHTML='<span class="mut">Loading...</span>';
+  try{
+    const r=await call('history',{page:HP.page,size:HP.size},60000); const list=r.tasks||[]; HP.total=+r.total||list.length;
+    if(TAB!=='hist') return;
+    if(!list.length&&HP.page>1){ HP.page=Math.max(1,Math.ceil(HP.total/HP.size)); return loadHistory(true); }
+    if(!list.length){ $('fileBox').innerHTML='<span class="mut">No print history.</span>'; return; }
+    const dur=(b,e)=>{ b=+b; e=+e; if(!b||!e||e<b) return '-'; return fmtS(b>1e12?(e-b)/1000:(e-b)); };
+    const rows=list.map((h,i)=>'<tr><td class="n" title="'+esc(h.name)+'">'+esc(h.name||'-')+'</td><td>'+fmtD(h.begin)+'</td><td>'+fmtD(h.end)+'</td><td>'+dur(h.begin,h.end)+'</td><td><span class="chip" title="Raw status code reported by the printer">'+esc(h.status==null?'-':'status '+h.status)+'</span></td><td><button class="dng" data-hd="'+i+'">Delete</button></td></tr>').join('');
+    $('fileBox').innerHTML='<table><tr><th>Task</th><th>Started</th><th>Ended</th><th>Duration</th><th>Result</th><th></th></tr>'+rows+'</table>'+pager('h',HP.total,HP.page,HP.size);
+    $('fileBox').querySelectorAll('[data-hd]').forEach(b=>b.onclick=()=>askHistDelete(list[+b.dataset.hd]));
+  }catch(e){ if(!silent) $('fileBox').innerHTML='<span class="mut">Could not load history: '+esc(e.message)+'</span>'; }
+}
+function askHistDelete(h){
+  PANEL++; const p=$('startPanel'); p.style.display='block';
+  p.innerHTML='Delete the history entry <b>'+esc(h.name||h.id)+'</b>? <button class="dng" id="yHd">Yes, delete</button> <button id="nHd">No</button>';
+  $('nHd').onclick=()=>{p.style.display='none';};
+  $('yHd').onclick=async()=>{ p.style.display='none'; try{ await run('Deleted','history_delete',{ids:[h.id]}); loadHistory(); }catch(e){} };
+}
+
+/* ---------- recorded graphs (canvas, no library) ---------- */
+let SAMPLES=[], RANGE=1800000, DRAWN=0; const HOV={};
+const cssv=n=>getComputedStyle(document.documentElement).getPropertyValue(n).trim()||'#888';
+const TSER=[{k:'Nozzle',i:1,c:'#ff7a45'},{k:'Nozzle target',i:2,c:'#ff7a45',dash:[5,4],w:1.2},{k:'Bed',i:3,c:'#4f8cff'},{k:'Bed target',i:4,c:'#4f8cff',dash:[5,4],w:1.2},{k:'Chamber',i:5,c:'#35c2a1'}];
+const FSER=[{k:'Model',i:6,c:'#ff7a45'},{k:'Assistance',i:7,c:'#4f8cff'},{k:'Case',i:8,c:'#35c2a1'}];
+const niceMax=v=>{ for(const s of [10,20,25,50,100,150,200,250,300,350,400]) if(v<=s) return s; return Math.ceil(v/50)*50; };
+const clk=t=>{ const d=new Date(t); return String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0'); };
+function drawChart(cv,tip,ser,unit,fixedMax){
+  const dpr=window.devicePixelRatio||1, w=cv.clientWidth||600, h=cv.clientHeight||230;
+  if(cv.width!==Math.round(w*dpr)||cv.height!==Math.round(h*dpr)){ cv.width=Math.round(w*dpr); cv.height=Math.round(h*dpr); }
+  const c=cv.getContext('2d'); c.setTransform(dpr,0,0,dpr,0,0); c.clearRect(0,0,w,h);
+  const L=44,R=10,T=10,B=22, pw=w-L-R, ph=h-T-B, now=Date.now(), t0=now-RANGE;
+  const pts=SAMPLES.filter(s=>s[0]>=t0);
+  const ymax=fixedMax||niceMax(Math.max(10,...pts.flatMap(s=>ser.map(d=>s[d.i]))));
+  const X=t=>L+(t-t0)/RANGE*pw, Y=v=>T+ph-(Math.min(Math.max(v,0),ymax)/ymax)*ph;
+  c.font='11px '+(cssv('--mono')||'monospace'); c.lineWidth=1; c.strokeStyle=cssv('--line'); c.fillStyle=cssv('--dim');
+  for(let k=0;k<=4;k++){ const v=ymax*k/4, y=Y(v); c.beginPath(); c.moveTo(L,y); c.lineTo(w-R,y); c.stroke(); c.fillText(Math.round(v)+unit,4,y+4); }
+  const step=RANGE<=300000?60000:RANGE<=1800000?300000:900000;
+  for(let t=Math.ceil(t0/step)*step;t<=now;t+=step){ const x=X(t); c.beginPath(); c.moveTo(x,T); c.lineTo(x,T+ph); c.stroke(); c.fillText(clk(t),x-14,h-6); }
+  for(const d of ser){ c.beginPath(); c.strokeStyle=d.c; c.lineWidth=d.w||1.9; c.setLineDash(d.dash||[]); let first=true;
+    for(const s of pts){ const x=X(s[0]), y=Y(s[d.i]); if(first){ c.moveTo(x,y); first=false; } else c.lineTo(x,y); } c.stroke(); }
+  c.setLineDash([]);
+  if(!pts.length){ c.fillStyle=cssv('--dim'); c.fillText('Waiting for data from the printer...',L+10,T+34); }
+  const hx=HOV[cv.id];
+  if(hx!=null&&pts.length){
+    const tt=t0+(hx-L)/pw*RANGE; let best=pts[0]; for(const s of pts) if(Math.abs(s[0]-tt)<Math.abs(best[0]-tt)) best=s;
+    const x=X(best[0]); c.strokeStyle=cssv('--dim'); c.beginPath(); c.moveTo(x,T); c.lineTo(x,T+ph); c.stroke();
+    tip.style.display='block'; tip.innerHTML='<b>'+clk(best[0])+':'+String(new Date(best[0]).getSeconds()).padStart(2,'0')+'</b><br>'+ser.map(d=>'<i style="display:inline-block;width:8px;height:8px;border-radius:50%;background:'+d.c+';margin-right:5px"></i>'+d.k+' '+Math.round(best[d.i])+unit).join('<br>');
+    tip.style.left=Math.max(4,Math.min(w-tip.offsetWidth-4,x+12))+'px';
+  } else tip.style.display='none';
+}
+function legend(el,ser,unit){ const l=SAMPLES.length?SAMPLES[SAMPLES.length-1]:null; el.innerHTML=ser.filter(d=>!d.dash).map(d=>'<span><i style="background:'+d.c+'"></i>'+d.k+(l?' <b>'+Math.round(l[d.i])+unit+'</b>':'')+'</span>').join(''); }
+function drawAll(){ DRAWN=0; try{ drawChart($('cT'),$('tipT'),TSER,'°',0); drawChart($('cF'),$('tipF'),FSER,'%',100); legend($('lgT'),TSER,'°'); legend($('lgF'),FSER,'%'); }catch(e){} }
+function scheduleDraw(){ if(DRAWN) return; DRAWN=requestAnimationFrame(drawAll); }
+for(const id of ['cT','cF']){ const cv=$(id); cv.onmousemove=e=>{ HOV[id]=e.clientX-cv.getBoundingClientRect().left; scheduleDraw(); }; cv.onmouseleave=()=>{ HOV[id]=null; scheduleDraw(); }; }
+document.querySelectorAll('.rangeb [data-r]').forEach(b=>b.onclick=()=>{ RANGE=+b.dataset.r; document.querySelectorAll('.rangeb [data-r]').forEach(x=>x.classList.toggle('sel',+x.dataset.r===RANGE)); scheduleDraw(); });
+document.querySelectorAll('.gclear').forEach(b=>b.onclick=()=>{ SAMPLES=[]; call('samples_clear').catch(()=>{}); scheduleDraw(); });
+window.addEventListener('resize',scheduleDraw); setInterval(scheduleDraw,15000); scheduleDraw();
+
+/* ---------- command console ---------- */
+const CON=$('console'); let CONN=0;
+const clock=t=>new Date(t).toTimeString().slice(0,8);
+function addCmd(e){
+  if(!CONN) CON.innerHTML=''; CONN++; const near=CON.scrollTop+CON.clientHeight>=CON.scrollHeight-30;
+  const d=document.createElement('div'); d.className='cl'+(e.ok?'':' bad');
+  d.innerHTML='<span class="ct">'+clock(e.t)+'</span><span class="cs">'+esc(e.src)+'</span><b>'+esc(e.label)+'</b><span class="cd">'+esc(e.detail||'')+'</span><span class="cr">'+(e.ok?'ok':'failed: '+esc(e.err))+' &middot; '+((e.ms||0)/1000).toFixed(1)+' s</span>';
+  CON.appendChild(d); while(CON.children.length>400) CON.removeChild(CON.firstChild); if(near) CON.scrollTop=CON.scrollHeight;
+}
+$('bConClear').onclick=()=>{ CON.innerHTML='<span class="mut">Cleared.</span>'; CONN=0; call('cmdlog_clear').catch(()=>{}); };
+
+loadAgora('AgoraRTM').catch(()=>{ setChip('cRtm','RTM: SDK not loaded','bad'); L('Check HTTPS access to cdn.jsdelivr.net, then retry Connect.'); });
+P({type:'ready'});
+setTimeout(loadAccount,600);
+</script>
+"""
+
+
+class CC2Page(orca.pages.PagesPluginCapabilityBase):
+    def __init__(self):
+        super().__init__()
+        HUB.page = self
+
+    def get_name(self):
+        return "Elegoo CC2"
+
+    def on_unload(self):
+        HUB.page = None
+        HUB.page_ready = False
+        HUB.rtm_online = False
+        HUB._stop_login_proxy()
+
+    def get_icon(self):
+        try:  # next to the plugin file, which lives under Orca's data dir (allowed root)
+            path = _HERE / "elegoo_cc2_icon.svg"
+            if not os.path.exists(path):
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(ICON_SVG)
+            return str(path)
+        except Exception:
+            return ""
+
+    def get_ui(self):
+        HUB.page_ready = False
+        HUB.rtm_online = False
+        return PAGE_HTML.replace("__CC2_LINUX__", "true" if IS_LINUX else "false")
+
+    def on_message(self, data):
+        HUB.on_page_message(data)
+
+
+@orca.plugin
+class ElegooCC2Plugin(orca.base):
+    def register_capabilities(self):
+        try:
+            orca.request_permissions(threading=True)
+        except Exception as e:
+            HUB.log("request_permissions failed: %r" % e)
+        orca.register_capability(CC2Page)
+        orca.register_capability(CC2Agent)
