@@ -6,7 +6,7 @@
 # name = "Elegoo CC2 Cloud"
 # description = "Send gcode to and control an Elegoo Centauri Carbon 2 from OrcaSlicer through the Elegoo cloud: upload, start/pause/stop, live status. Reuses your ElegooSlicer login (close ElegooSlicer while connected)."
 # author = "personal use"
-# version = "0.2.0"
+# version = "0.3.0"
 # ///
 """
 Elegoo Centauri Carbon 2 - cloud printer agent for OrcaSlicer 2.5.x
@@ -47,7 +47,10 @@ AGENT_ID = "elegoo_cc2_cloud"
 AGORA_APP_ID = "d035320941e34cd5bc4ec106eff05580"  # public id from elegoo-link rtm_service.cpp
 USER_INFO = os.path.expandvars(r"%APPDATA%\ElegooSlicer\user\user_info")
 _HERE = os.path.dirname(os.path.abspath(__file__))
-SESSION_FILE = os.path.join(_HERE, "cc2_session.dat")   # DPAPI-encrypted, under the Orca data dir
+# Orca deletes the whole plugin folder on reinstall, so keep the session and preferences next to it, in the
+# application data dir (<data_dir>/plugin_data/...). CC2_DATA_DIR overrides this for tests.
+_DATA = os.environ.get("CC2_DATA_DIR") or os.path.join(os.path.dirname(os.path.dirname(_HERE)), "plugin_data", "elegoo_cc2_cloud")
+SESSION_FILE = os.path.join(_DATA, "cc2_session.dat")   # DPAPI-encrypted
 LOGIN_URL = "https://account.elegoo.com/account/slicer-login?region=%s&theme=%s&deviceId=%s"
 UA = "Mozilla/5.0"
 
@@ -479,15 +482,18 @@ class Session:
     def get(self):
         with self.lock:
             if self.d is None:
-                try:
-                    self.d = json.loads(_dpapi(_read_bytes(SESSION_FILE)).decode("utf-8"))
-                except Exception:
-                    self.d = {}
+                for path in (SESSION_FILE, os.path.join(_HERE, "cc2_session.dat")):   # old location as a fallback
+                    try:
+                        self.d = json.loads(_dpapi(_read_bytes(path)).decode("utf-8"))
+                        break
+                    except Exception:
+                        self.d = {}
             return dict(self.d)
 
     def save(self, d):
         with self.lock:
             self.d = dict(d)
+            os.makedirs(os.path.dirname(SESSION_FILE), exist_ok=True)
             with open(SESSION_FILE, "wb") as f:
                 f.write(_protect(json.dumps(self.d).encode("utf-8")))
 
@@ -509,6 +515,30 @@ class Session:
 
 
 SESSION = Session()
+
+PREFS_FILE = os.path.join(_DATA, "cc2_prefs.json")
+OPEN_OK = ("https://0xpraet0rian.github.io/", "https://github.com/0xpraet0rian")
+
+
+def _prefs_get():
+    try:
+        d = json.loads(_read_bytes(PREFS_FILE).decode("utf-8"))
+    except Exception:
+        d = {}
+    return {"mode": d.get("mode") if d.get("mode") in ("auto", "dark", "light") else "auto",
+            "style": d.get("style") if d.get("style") in ("0x", "orca") else "0x"}
+
+
+def _prefs_set(mode, style):
+    d = _prefs_get()
+    if mode in ("auto", "dark", "light"):
+        d["mode"] = mode
+    if style in ("0x", "orca"):
+        d["style"] = style
+    os.makedirs(os.path.dirname(PREFS_FILE), exist_ok=True)
+    with open(PREFS_FILE, "w", encoding="utf-8") as f:
+        json.dump(d, f)
+    return d
 
 
 def _refresh_session():
@@ -542,10 +572,10 @@ def _token():
     return SESSION.get().get("token", "")
 
 
-def _api(path, params=None):
+def _api(path, params=None, method="GET"):
     tok = _token()
     url = BASE + path + (("?" + urllib.parse.urlencode(params)) if params else "")
-    status, body = _http("GET", url, {"Authorization": "Bearer " + tok})
+    status, body = _http(method, url, {"Authorization": "Bearer " + tok})
     if status in (401, 403):
         raise RuntimeError("Elegoo cloud HTTP %s (session expired? sign in again in the Elegoo CC2 tab)" % status)
     if status != 200:
@@ -678,6 +708,7 @@ class Hub:
                 self.rtm_online = False
                 self.log("RTM page ready")
                 self._post({"type": "logs", "lines": list(self.logs)[-100:]})
+                self._post(dict(_prefs_get(), type="prefs"))
                 self._push_account()
                 threading.Thread(target=self._auto_connect, daemon=True, name="cc2-autoconnect").start()
             elif t == "login_ok" and not stale:
@@ -834,22 +865,44 @@ class Hub:
             SESSION.update(auto=bool(p.get("on")))
             return self.account_state()
         if m == "files":
+            try:
+                return {"files": self._files_http(), "source": "cloud"}
+            except Exception as e:
+                self.log("file list over HTTP failed (%s); asking the printer in small pages" % e)
             files, page = [], 1
-            while page <= 20:
-                r = self.request(1044, {"storage_media": "local", "path": "/", "page": page, "page_size": 50}, timeout=25)
+            while page <= 30:
+                r = self.request(1044, {"storage_media": "local", "path": "/", "page": page, "page_size": 8}, timeout=15)
                 lst = r.get("file_list") or []
                 for f in lst:
                     if isinstance(f, dict) and f.get("type", "file") == "file":
                         files.append({k: f.get(k) for k in ("filename", "size", "layer", "print_time",
                                                             "total_filament_used", "color_map", "create_time")})
-                if len(lst) < 50:
+                if len(lst) < 8:
                     break
                 page += 1
-            return {"files": files}
+            return {"files": files, "source": "printer"}
+        if m == "prefs_get":
+            return _prefs_get()
+        if m == "prefs_set":
+            return _prefs_set(p.get("mode"), p.get("style"))
+        if m == "open_url":
+            url = str(p.get("url", ""))
+            if url not in OPEN_OK:
+                raise ValueError("link not allowed")
+            _open_url(url)
+            return {}
+        if m == "history_delete":
+            ids = [str(x) for x in (p.get("ids") or [])]
+            import re as _re
+            if not ids or any(not _re.fullmatch(r"[0-9A-Za-z_\-]{1,40}", x) for x in ids):
+                raise ValueError("bad id")
+            _api("/api/v1/device-management-server/device-data/event-data",
+                 {"ids": ",".join(ids), "deviceCode": self.sn or SESSION.get().get("sn", "")}, method="DELETE")
+            return {}
         if m == "canvas":
             return self.request(2005, {}, timeout=15)
         if m == "history":
-            return self.request(1036, {}, timeout=25)
+            return self._history_http()
         if m == "start_file":
             if not idle:
                 raise RuntimeError("the printer is not idle")
@@ -1048,6 +1101,55 @@ class Hub:
         except Exception:
             pass
 
+    # ---- cloud-side lists (no RTM message size limit; the same API ElegooSlicer uses)
+    @staticmethod
+    def _norm_file(f):
+        cm = []
+        try:
+            raw = f.get("colorMap")
+            arr = json.loads(raw) if isinstance(raw, str) and raw else (raw or [])
+            for e in arr if isinstance(arr, list) else []:
+                t = e.get("t")
+                cm.append({"t": int(t) if isinstance(t, (int, float)) and t >= 0 else 0,
+                           "color": str(e.get("color", "")), "name": str(e.get("type", ""))})
+        except Exception:
+            cm = []
+        return {"filename": f.get("filename") or f.get("fileName") or "", "size": f.get("size"), "layer": f.get("layer"),
+                "print_time": f.get("printTime"), "total_filament_used": f.get("totalFilamentUsed"),
+                "color_map": cm, "create_time": f.get("createTime")}
+
+    def _files_http(self):
+        sn = self.sn or SESSION.get().get("sn", "")
+        out, page, total = [], 1, None
+        while page <= 40:
+            d = _dict(_api("/api/v1/device-management-server/local-file/page",
+                           {"serialNo": sn, "pageNo": page, "pageSize": 50}))
+            lst = d.get("list") or []
+            out += [self._norm_file(f) for f in lst if isinstance(f, dict)]
+            total = d.get("total", total)
+            if len(lst) < 50 or (total is not None and len(out) >= int(_num(total))):
+                break
+            page += 1
+        return [f for f in out if f["filename"]]
+
+    def _history_http(self):
+        sn = self.sn or SESSION.get().get("sn", "")
+        d = _dict(_api("/api/v1/device-management-server/device/event-data/page",
+                       {"deviceCode": sn, "pageNo": 1, "pageSize": 50, "eventKey": "history_task",
+                        "sort": "create_time,desc"}))
+        tasks = []
+        for it in d.get("list") or []:
+            if not isinstance(it, dict):
+                continue
+            ev = it.get("eventValue")
+            try:
+                ev = json.loads(ev) if isinstance(ev, str) else _dict(ev)
+            except Exception:
+                ev = {}
+            tasks.append({"id": str(it.get("id", "")), "name": str(ev.get("task_name", "") or ""),
+                          "begin": ev.get("begin_time"), "end": ev.get("end_time"), "status": ev.get("task_status")})
+        return {"tasks": tasks, "total": d.get("total")}
+
     def _fail_pending(self, rid, err):
         with self.lock:
             slot = self.pending.get(rid)
@@ -1060,7 +1162,7 @@ class Hub:
         try:
             m = json.loads(text)
         except Exception:
-            self.log("non-JSON RTM payload ignored")
+            self.log("RTM reply was not valid JSON (%d bytes; probably cut off by the message size limit)" % len(text))
             return
         if not isinstance(m, dict):
             return
@@ -1443,7 +1545,7 @@ class CC2Agent(pa.PrinterAgentBase):
 
     def get_agent_info(self):
         i = pa.AgentInfo()
-        i.id, i.name, i.version = AGENT_ID, "Elegoo CC2 (cloud)", "0.2.0"
+        i.id, i.name, i.version = AGENT_ID, "Elegoo CC2 (cloud)", "0.3.0"
         i.description = "Elegoo Centauri Carbon 2 via the Elegoo cloud"
         return i
 
@@ -1696,73 +1798,90 @@ ICON_SVG = r"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" wid
 
 PAGE_HTML = r"""<!doctype html><meta charset="utf-8">
 <style>
- :root{--bg:var(--orca-bg,#f2f4f7);--fg:var(--orca-fg,#1d2733);--mut:var(--orca-muted,#677485);--acc:var(--orca-accent,#0f766e);
-  --bd:var(--orca-border,#d9dfe6);--card:#ffffff;--ctl:#ffffff;--soft:#eaeff3;--bad:#c0392b;--ok:#0f766e;--warn:#b7791f;
-  --r:14px;--sh:0 1px 2px rgba(16,24,40,.05),0 2px 8px rgba(16,24,40,.06)}
- @media (prefers-color-scheme:dark){:root{--bg:var(--orca-bg,#1b1f23);--fg:var(--orca-fg,#e7ebef);--mut:var(--orca-muted,#8c98a5);
-  --bd:var(--orca-border,#38414a);--card:#242a30;--ctl:#2c343b;--soft:#303941;--bad:#ef6b5d;--ok:#35c2b3;--warn:#e0b04a;--sh:0 1px 2px rgba(0,0,0,.35)}}
+ :root{--radius:16px;--mono:ui-monospace,"JetBrains Mono","Fira Code",SFMono-Regular,Menlo,Consolas,monospace;--sans:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+ :root,:root[data-mode="dark"][data-style="0x"]{--bg:#141b28;--bgimg:radial-gradient(circle at 15% 0%,#1f2c40 0%,#0f151f 60%);--panel:rgba(255,255,255,.06);--panel2:rgba(255,255,255,.1);--line:rgba(255,255,255,.12);
+  --text:#edf1f5;--dim:#9fb0c3;--acc:#ff6600;--acc2:#cc5200;--glow:rgba(255,102,0,.35);--ok:#3ddc97;--bad:#ff6b6b;--warn:#ffb020;--shadow:0 8px 32px rgba(0,0,0,.45);--onacc:#fff;--grid:rgba(255,255,255,.035)}
+ :root[data-mode="light"][data-style="0x"]{--bg:#f4f2ee;--bgimg:radial-gradient(circle at 15% 0%,#ffffff 0%,#ebe7e0 70%);--panel:rgba(255,255,255,.85);--panel2:rgba(20,27,40,.06);--line:rgba(20,27,40,.14);
+  --text:#18212f;--dim:#5a6a7d;--acc:#e25a00;--acc2:#b84900;--glow:rgba(226,90,0,.25);--ok:#12805a;--bad:#c9302c;--warn:#9a6300;--shadow:0 6px 24px rgba(20,27,40,.10);--onacc:#fff;--grid:rgba(20,27,40,.05)}
+ :root[data-mode="dark"][data-style="orca"]{--bg:#1b1f23;--bgimg:none;--panel:#242a30;--panel2:#2f373e;--line:#38414a;--text:#e7ebef;--dim:#8c98a5;--acc:#14b8a6;--acc2:#0f9488;--glow:rgba(20,184,166,.3);--ok:#35c2b3;--bad:#ef6b5d;--warn:#e0b04a;--shadow:0 2px 10px rgba(0,0,0,.35);--onacc:#06201d;--grid:transparent}
+ :root[data-mode="light"][data-style="orca"]{--bg:#f2f4f7;--bgimg:none;--panel:#ffffff;--panel2:#edf1f4;--line:#d9dfe6;--text:#1d2733;--dim:#677485;--acc:#0f766e;--acc2:#0b5f58;--glow:rgba(15,118,110,.22);--ok:#0f766e;--bad:#c0392b;--warn:#b7791f;--shadow:0 1px 3px rgba(16,24,40,.08);--onacc:#fff;--grid:transparent}
  *{box-sizing:border-box}
- body{font:13px/1.45 var(--orca-font,'Segoe UI',system-ui,sans-serif);color:var(--fg);background:var(--bg);margin:0;padding:16px;max-width:1320px;margin-inline:auto}
- h3{margin:0;font-size:12px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;color:var(--mut)}
- .mut{color:var(--mut)} b{font-weight:600}
- .top{display:flex;gap:14px;align-items:center;flex-wrap:wrap;margin-bottom:14px}
- .top svg{flex:none;border-radius:9px;box-shadow:var(--sh)}
- .top .name{font-size:20px;font-weight:650;line-height:1.15} .chips{display:flex;gap:6px;flex-wrap:wrap;margin-left:auto}
- .chip{display:inline-flex;align-items:center;gap:6px;padding:3px 10px;border-radius:999px;border:1px solid var(--bd);background:var(--card);font-size:12px;white-space:nowrap}
- .chip::before{content:"";width:7px;height:7px;border-radius:50%;background:var(--mut);opacity:.6}
+ html,body{margin:0;width:100%;min-height:100%}
+ body{font:13px/1.5 var(--sans);color:var(--text);background:var(--bg) var(--bgimg) fixed;position:relative}
+ body::before{content:"";position:fixed;inset:0;pointer-events:none;background-image:linear-gradient(var(--grid) 1px,transparent 1px),linear-gradient(90deg,var(--grid) 1px,transparent 1px);background-size:44px 44px}
+ #app{position:relative;width:100%;max-width:1840px;margin:0 auto;padding:22px clamp(12px,2.2vw,36px) 36px}
+ h3{margin:0;font:650 14px var(--sans);color:var(--text);letter-spacing:.01em}
+ .mut{color:var(--dim)} b{font-weight:600} a{color:var(--acc);text-decoration:none;cursor:pointer} a:hover{text-decoration:underline}
+ .top{display:flex;gap:16px;align-items:center;flex-wrap:wrap;margin-bottom:18px}
+ .top svg{flex:none;border-radius:12px;box-shadow:0 0 0 1px var(--line),0 6px 18px var(--glow)}
+ .prompt{font:12px var(--mono);color:var(--dim)} .prompt b{color:var(--acc);font-weight:600}
+ .top .name{font-size:26px;font-weight:700;line-height:1.1;letter-spacing:-.01em}
+ .right{margin-left:auto;display:flex;flex-direction:column;align-items:flex-end;gap:8px}
+ .chips{display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end}
+ .chip{display:inline-flex;align-items:center;gap:6px;padding:3px 11px;border-radius:999px;border:1px solid var(--line);background:var(--panel);font:12px var(--mono);white-space:nowrap}
+ .chip::before{content:"";width:7px;height:7px;border-radius:50%;background:var(--dim);opacity:.7}
  .chip.ok{border-color:var(--ok);color:var(--ok)} .chip.ok::before{background:var(--ok);opacity:1}
  .chip.bad{border-color:var(--bad);color:var(--bad)} .chip.bad::before{background:var(--bad);opacity:1}
  .chip.warn{border-color:var(--warn);color:var(--warn)} .chip.warn::before{background:var(--warn);opacity:1}
- .cols{display:grid;gap:14px;grid-template-columns:repeat(2,minmax(0,1fr));align-items:stretch;transition:opacity .2s}
- @media (max-width:820px){.cols{grid-template-columns:1fr}}
- .card{display:flex;flex-direction:column;background:var(--card);border:1px solid var(--bd);border-radius:var(--r);padding:14px 16px;box-shadow:var(--sh)}
- .card>h3{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:12px;min-height:26px}
- .card>h3 .mut{text-transform:none;letter-spacing:0;font-weight:500;font-size:12px}
- button{font:inherit;font-weight:500;padding:5px 12px;min-height:30px;border:1px solid var(--bd);border-radius:8px;background:var(--ctl);color:var(--fg);cursor:pointer;transition:background .12s,border-color .12s,transform .05s}
- button:hover:not(:disabled){border-color:var(--acc);color:var(--acc)} button:active:not(:disabled){transform:translateY(1px)}
- button:disabled{opacity:.42;cursor:not-allowed}
- button.pri{background:var(--acc);border-color:var(--acc);color:#fff} button.pri:hover:not(:disabled){color:#fff;filter:brightness(1.08)}
- button.dng{border-color:var(--bad);color:var(--bad)} button.dng:hover:not(:disabled){background:var(--bad);color:#fff}
- button.sel{background:var(--acc);border-color:var(--acc);color:#fff}
- input[type=number],select{font:inherit;padding:4px 8px;min-height:30px;border:1px solid var(--bd);border-radius:8px;background:var(--ctl);color:var(--fg)}
- input[type=number]{width:72px} input[type=range]{accent-color:var(--acc);width:100%} input[type=checkbox]{accent-color:var(--acc)}
- .row{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:6px 0}
- .bar{height:10px;border-radius:6px;background:var(--soft);overflow:hidden} .bar>i{display:block;height:100%;background:var(--acc);width:0%;transition:width .4s}
- .kv{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin:12px 0} .kv div{display:flex;flex-direction:column}
- .k{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--mut)} .v{font-weight:600;font-size:15px}
- .pad{display:grid;grid-template-columns:repeat(3,46px);grid-template-rows:repeat(3,40px);gap:6px} .pad button{padding:0}
- .zcol{display:flex;flex-direction:column;gap:6px} .zcol button{width:46px;height:40px;padding:0}
- .slots{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin:6px 0}
- .slot{border:2px solid var(--bd);border-radius:12px;padding:10px 4px;text-align:center;cursor:pointer;background:var(--ctl);transition:border-color .12s,box-shadow .12s}
- .slot:hover{border-color:var(--acc)} .slot.on{border-color:var(--acc);box-shadow:0 0 0 3px rgba(15,118,110,.2)}
- .slot .dot{width:36px;height:36px;border-radius:50%;margin:0 auto 5px;border:1px solid #0003}
- .slot small{display:block;color:var(--mut)} .slot.empty .dot{background:repeating-linear-gradient(45deg,#ddd,#ddd 4px,#fff 4px,#fff 8px)}
- table{width:100%;border-collapse:collapse} th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--bd);vertical-align:middle}
- tr:hover td{background:var(--soft)} th{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--mut);font-weight:600}
- td.n{max-width:380px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
- .tabs{display:flex;gap:6px;align-items:center} .dots i{display:inline-block;width:11px;height:11px;border-radius:50%;margin-right:3px;border:1px solid #0003}
- .toolbar{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;flex-wrap:wrap;gap:8px}
- #note{position:sticky;top:0;z-index:5;margin:0 0 12px;padding:9px 14px;border-radius:10px;display:none;border:1px solid var(--bd);background:var(--card);box-shadow:var(--sh)}
+ .themebar{display:flex;gap:6px;align-items:center;font:12px var(--mono);color:var(--dim)}
+ .cols{display:grid;gap:16px;grid-template-columns:repeat(auto-fit,minmax(min(100%,480px),1fr));align-items:stretch;transition:opacity .2s}
+ .card{display:flex;flex-direction:column;background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:16px 18px;box-shadow:var(--shadow);backdrop-filter:blur(18px) saturate(140%);-webkit-backdrop-filter:blur(18px) saturate(140%)}
+ .card>h3{display:flex;align-items:center;gap:0;margin-bottom:14px;min-height:28px}
+ .card>h3>*:first-child{margin-left:auto}
+ .card>h3 .mut{font:500 12px var(--sans)}
+ button{font:inherit;font-weight:500;padding:5px 13px;min-height:30px;border:1px solid var(--line);border-radius:10px;background:var(--panel2);color:var(--text);cursor:pointer;transition:border-color .12s,box-shadow .12s,transform .05s,background .12s}
+ button:hover:not(:disabled){border-color:var(--acc);box-shadow:0 0 0 3px var(--glow)} button:active:not(:disabled){transform:translateY(1px)}
+ button:disabled{opacity:.4;cursor:not-allowed}
+ button.pri{background:var(--acc);border-color:var(--acc);color:var(--onacc);box-shadow:0 4px 16px var(--glow)} button.pri:hover:not(:disabled){background:var(--acc2);border-color:var(--acc2)}
+ button.dng{color:var(--bad);border-color:var(--bad);background:transparent} button.dng:hover:not(:disabled){background:var(--bad);color:#fff;box-shadow:none}
+ button.sel{background:var(--acc);border-color:var(--acc);color:var(--onacc)}
+ button.ico{min-width:30px;padding:3px 8px;font-size:15px}
+ input[type=number],select{font:inherit;padding:4px 9px;min-height:30px;border:1px solid var(--line);border-radius:10px;background:var(--panel2);color:var(--text)}
+ select option{background:#222;color:#eee} input[type=number]{width:74px}
+ input[type=range]{accent-color:var(--acc);width:100%} input[type=checkbox]{accent-color:var(--acc)}
+ .row{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:7px 0}
+ .bar{height:10px;border-radius:6px;background:var(--panel2);overflow:hidden} .bar>i{display:block;height:100%;background:linear-gradient(90deg,var(--acc2),var(--acc));width:0%;transition:width .4s;box-shadow:0 0 12px var(--glow)}
+ .kv{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin:14px 0} .kv div{display:flex;flex-direction:column}
+ .k{font:11px var(--mono);text-transform:uppercase;letter-spacing:.06em;color:var(--dim)} .v{font-weight:650;font-size:16px}
+ .pad{display:grid;grid-template-columns:repeat(3,48px);grid-template-rows:repeat(3,42px);gap:6px} .pad button{padding:0}
+ .zcol{display:flex;flex-direction:column;gap:6px} .zcol button{width:48px;height:42px;padding:0}
+ .slots{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:12px;margin:6px 0}
+ .slot{border:2px solid var(--line);border-radius:14px;padding:12px 6px;text-align:center;cursor:pointer;background:var(--panel2);transition:border-color .12s,box-shadow .12s}
+ .slot:hover{border-color:var(--acc)} .slot.on{border-color:var(--acc);box-shadow:0 0 0 4px var(--glow)}
+ .slot .dot{width:38px;height:38px;border-radius:50%;margin:0 auto 6px;border:1px solid #0004}
+ .slot small{display:block;color:var(--dim);font-family:var(--mono)} .slot.empty .dot{background:repeating-linear-gradient(45deg,#777,#777 4px,#999 4px,#999 8px)}
+ table{width:100%;border-collapse:collapse} th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--line);vertical-align:middle}
+ tr:hover td{background:var(--panel2)} th{font:11px var(--mono);text-transform:uppercase;letter-spacing:.06em;color:var(--dim);font-weight:500}
+ td.n{max-width:420px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--mono);font-size:12px}
+ .tabs{display:flex;gap:6px;align-items:center} .dots i{display:inline-block;width:11px;height:11px;border-radius:50%;margin-right:3px;border:1px solid #0004}
+ .toolbar{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;flex-wrap:wrap;gap:8px}
+ #note{position:sticky;top:8px;z-index:5;margin:0 0 14px;padding:10px 16px;border-radius:12px;display:none;border:1px solid var(--line);background:var(--panel);box-shadow:var(--shadow);backdrop-filter:blur(18px)}
  #note.bad{border-color:var(--bad);color:var(--bad)} #note.ok{border-color:var(--ok);color:var(--ok)}
- .cols.off{opacity:.38;pointer-events:none;filter:grayscale(.5)}
- .panel{border:1px dashed var(--acc);border-radius:10px;padding:12px;margin:10px 0;background:var(--soft)}
+ .cols.off{opacity:.36;pointer-events:none;filter:grayscale(.6)}
+ .panel{border:1px dashed var(--acc);border-radius:12px;padding:12px 14px;margin:10px 0;background:var(--panel2)}
  .sw{display:inline-flex;align-items:center;gap:6px;cursor:pointer}
- details pre{background:var(--soft);padding:10px;max-height:240px;overflow:auto;white-space:pre-wrap;border-radius:8px;font:12px/1.4 ui-monospace,Consolas,monospace}
- summary{cursor:pointer;padding:6px 2px}
- .rng{display:grid;grid-template-columns:92px 1fr 46px;gap:10px;align-items:center;margin:8px 0} .rng b{text-align:right}
- /* camera: drag the corner to resize; presets and full screen on the toolbar */
- #camWrap{display:none;position:relative;resize:both;overflow:hidden;width:min(100%,720px);height:405px;min-width:260px;min-height:160px;max-width:100%;
-  background:#000;border-radius:12px;margin:0 auto;border:1px solid var(--bd)}
+ details pre{background:var(--panel2);padding:12px;max-height:260px;overflow:auto;white-space:pre-wrap;border-radius:10px;font:12px/1.45 var(--mono)}
+ summary{cursor:pointer;padding:8px 2px;font:12px var(--mono);color:var(--dim)}
+ .rng{display:grid;grid-template-columns:92px 1fr 46px;gap:12px;align-items:center;margin:9px 0} .rng b{text-align:right;font-family:var(--mono)}
+ #camWrap{display:none;position:relative;resize:both;overflow:hidden;width:min(100%,760px);height:428px;min-width:260px;min-height:160px;max-width:100%;
+  background:#000;border-radius:14px;margin:0 auto;border:1px solid var(--line);box-shadow:var(--shadow)}
  #camBox{position:absolute;inset:0} #camBox video{object-fit:contain !important}
  #camBar{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
- #camMsg{min-height:18px;margin-top:8px;text-align:center}
+ #camMsg{min-height:18px;margin-top:10px;text-align:center}
+ footer{margin-top:26px;padding-top:14px;border-top:1px solid var(--line);font:12px var(--mono);color:var(--dim);display:flex;gap:14px;flex-wrap:wrap;justify-content:space-between}
 </style>
 
+<div id="app">
 <div id="note"></div>
 <div class="top">
-  <svg width="40" height="40" viewBox="0 0 128 128" aria-hidden="true"><rect width="128" height="128" rx="26" fill="#0f766e"/><path transform="translate(0 4)" d="M40 58a15 15 0 0 1 14-20 20 20 0 0 1 37 6 13 13 0 0 1-1 26H44a12 12 0 0 1-4-12z" fill="#ccfbf1"/><rect x="34" y="66" width="60" height="44" rx="5" fill="none" stroke="#f0fdfa" stroke-width="5"/><line x1="34" y1="80" x2="94" y2="80" stroke="#f0fdfa" stroke-width="4"/><rect x="58" y="76" width="12" height="9" rx="2" fill="#5eead4"/><path d="M61 85h6l-3 6z" fill="#5eead4"/></svg>
-  <div><div class="name" id="pname">Elegoo CC2</div><div class="mut" id="pinfo"></div></div>
-  <div class="chips"><span class="chip" id="cRtm">RTM: starting</span><span class="chip" id="cPr">Printer: -</span><span class="chip" id="cSt">-</span></div>
+  <svg width="46" height="46" viewBox="0 0 128 128" aria-hidden="true"><rect width="128" height="128" rx="26" fill="#ff6600"/><path transform="translate(0 4)" d="M40 58a15 15 0 0 1 14-20 20 20 0 0 1 37 6 13 13 0 0 1-1 26H44a12 12 0 0 1-4-12z" fill="#fff3e8"/><rect x="34" y="66" width="60" height="44" rx="5" fill="none" stroke="#fff" stroke-width="5"/><line x1="34" y1="80" x2="94" y2="80" stroke="#fff" stroke-width="4"/><rect x="58" y="76" width="12" height="9" rx="2" fill="#ffd2b0"/><path d="M61 85h6l-3 6z" fill="#ffd2b0"/></svg>
+  <div><div class="prompt"><b>0x@printer</b>:~$ status</div><div class="name" id="pname">Elegoo CC2</div><div class="mut" id="pinfo"></div></div>
+  <div class="right">
+    <div class="chips"><span class="chip" id="cRtm">RTM: starting</span><span class="chip" id="cPr">Printer: -</span><span class="chip" id="cSt">-</span></div>
+    <div class="themebar"><span>theme</span>
+      <select id="thMode" title="Dark, light or follow the system"><option value="auto">auto</option><option value="dark">dark</option><option value="light">light</option></select>
+      <select id="thStyle" title="Colour style"><option value="0x">0xpraet0rian</option><option value="orca">orca teal</option></select></div>
+  </div>
 </div>
 
 <div class="card" id="acct" style="margin-bottom:12px">
@@ -1839,20 +1958,23 @@ PAGE_HTML = r"""<!doctype html><meta charset="utf-8">
   </div>
 
   <div class="card" style="grid-column:1/-1">
-    <h3>Filament <span><label class="sw"><input type="checkbox" id="autoRefill"> Auto refill</label> <button id="bCanvas">Refresh</button></span></h3>
-    <div class="slots" id="slots"><span class="mut">Press Refresh to read the filament slots.</span></div>
+    <h3>Filament <span><label class="sw"><input type="checkbox" id="autoRefill"> Auto refill</label> <button id="bCanvas" class="ico" title="Reload filament slots (also automatic)">&#8635;</button></span></h3>
+    <div class="slots" id="slots"><span class="mut">Reading the filament slots...</span></div>
     <div class="row"><button id="bLoad">Load</button><button id="bUnload">Unload</button><span class="mut">Select a slot first.</span>
       <span style="margin-left:auto" class="mut">Extruder:</span><button id="bFeed">Feed</button><button id="bRetreat">Retract</button></div>
   </div>
 
   <div class="card" style="grid-column:1/-1">
-    <div class="toolbar"><div class="tabs"><button id="tFiles" class="sel">Printer files</button><button id="tHist">Print history</button></div><button id="bFiles">Refresh</button></div>
+    <div class="toolbar"><div class="tabs"><button id="tFiles" class="sel">Printer files</button><button id="tHist">Print history</button></div><button id="bFiles" class="ico" title="Reload (also automatic)">&#8635;</button></div>
     <div id="startPanel" class="panel" style="display:none"></div>
-    <div id="fileBox"><span class="mut">Press Refresh to list the files.</span></div>
+    <div id="fileBox"><span class="mut">Reading the file list...</span></div>
   </div>
 </div>
 
 <details style="margin-top:12px"><summary class="mut">Log</summary><pre id="log"></pre></details>
+
+<footer><span><span style="color:var(--acc)">$</span> plugin by <a data-open="https://0xpraet0rian.github.io/">0xpraet0rian</a> &middot; <a data-open="https://github.com/0xpraet0rian">GitHub &#8599;</a> &middot; <a data-open="https://0xpraet0rian.github.io/">portfolio &#8599;</a></span><span>elegoo cc2 cloud &middot; v0.3</span></footer>
+</div>
 
 <script>
 // The page lives on an opaque origin inside Orca: localStorage/sessionStorage throw. Give the SDK in-memory ones.
@@ -1916,9 +2038,16 @@ const col=s=>/^#?[0-9a-f]{3,8}$/i.test(String(s||''))?(String(s)[0]==='#'?String
 const num=v=>(+v)|0;
 
 /* ---------- live state ---------- */
+let FIRST=true;
+function autoHooks(prev,m){
+  if(FIRST){ FIRST=false; setTimeout(()=>{ loadCanvas(true); refresh(true); },400); }
+  if(prev&&prev.code===2&&m.code!==2) setTimeout(()=>{ refresh(true); loadCanvas(true); },2500);   // a print just ended
+  if(prev&&prev.code!==1&&m.code===1) setTimeout(()=>loadCanvas(true),1500);                       // back to idle (filament ops etc.)
+}
 let S={code:null,state:'IDLE',homed:'',online:false}; let STEP=10, dragging=null, BUSY=false;
 const active=m=>m.code===2&&m.sub!==2077&&m.sub!==2504;
 function applyStatus(m){
+  autoHooks(S,m);
   S=m; const idle=(m.code===1)&&!BUSY, printing=active(m), paused=(m.state==='PAUSE');
   $('cSt').textContent=m.label||m.state; $('cSt').className='chip '+(printing?'ok':(m.code===14?'bad':''));
   $('pFile').textContent=m.file||''; $('pBar').style.width=Math.min(100,m.progress||0)+'%';
@@ -1953,6 +2082,7 @@ async function handle(m){
   else if(m.type==='logs') (m.lines||[]).forEach(L);
   else if(m.type==='info'){ $('pname').textContent=m.name||'Elegoo CC2'; $('pinfo').textContent=[m.model,'firmware '+(m.fw||'?'),'LAN IP '+(m.ip||'?'),'SN '+(m.sn||'?')].join('  |  '); }
   else if(m.type==='note'){ note(m.text,m.kind); }
+  else if(m.type==='prefs'){ PREFS={mode:m.mode||'auto',style:m.style||'0x'}; applyTheme(); }
   else if(m.type==='connstat'){ const e=$('aStat'); e.textContent=m.text; e.style.color=m.kind==='bad'?'var(--bad)':(m.kind==='ok'?'var(--ok)':''); }
   else if(m.type==='account'){ renderAccount(m); }
   else if(m.type==='conn'){ setChip('cPr','Printer: '+(m.printer?'online':'offline'),m.printer?'ok':'bad'); if(m.msg) note(m.msg,m.printer?'ok':'bad'); if(!m.printer){ $('ctl').classList.add('off'); $('ctlHint').style.display='block'; $('aStat').textContent=m.msg||'Printer is offline in the Elegoo cloud'; $('aStat').style.color='var(--bad)'; } }
@@ -1964,9 +2094,23 @@ orca.onMessage(handle);
 setInterval(()=>P({type:'pull'}),300);
 
 /* ---------- controls ---------- */
+/* ---------- theme, links ---------- */
+let PREFS={mode:'auto',style:'0x'};
+const mq=window.matchMedia?matchMedia('(prefers-color-scheme: dark)'):null;
+function applyTheme(){
+  const dark=PREFS.mode==='dark'||(PREFS.mode==='auto'&&(!mq||mq.matches));
+  document.documentElement.dataset.mode=dark?'dark':'light'; document.documentElement.dataset.style=PREFS.style==='orca'?'orca':'0x';
+  $('thMode').value=PREFS.mode; $('thStyle').value=PREFS.style;
+}
+if(mq&&mq.addEventListener) mq.addEventListener('change',()=>{ if(PREFS.mode==='auto') applyTheme(); });
+function setPrefs(){ PREFS={mode:$('thMode').value,style:$('thStyle').value}; applyTheme(); call('prefs_set',PREFS).catch(()=>{}); }
+$('thMode').onchange=setPrefs; $('thStyle').onchange=setPrefs; applyTheme();
+document.addEventListener('click',e=>{ const a=e.target.closest&&e.target.closest('[data-open]'); if(a){ e.preventDefault(); call('open_url',{url:a.dataset.open}).catch(()=>note('Could not open the link','bad')); } });
+
 /* ---------- account ---------- */
 let ACC=null;
 function renderAccount(a){
+  if(!a.rtm) FIRST=true;
   ACC=a; $('aOut').style.display=a.logged?'none':'block'; $('aIn').style.display=a.logged?'block':'none';
   if(!a.logged){ return; }
   $('aMail').textContent=a.email||a.nickname||'(account)'; $('aSrc').textContent=a.source==='imported'?'(session imported from ElegooSlicer)':'';
@@ -2058,7 +2202,7 @@ function renderCanvas(){
   } }
   $('autoRefill').checked=!!CANVAS.auto_refill;
 }
-async function loadCanvas(){ try{ const r=await call('canvas'); CANVAS=r.canvas_info||null; renderCanvas(); }catch(e){ note('Canvas: '+e.message,'bad'); } }
+async function loadCanvas(silent){ try{ const r=await call('canvas',{},30000); CANVAS=r.canvas_info||null; renderCanvas(); }catch(e){ if(!silent) note('Canvas: '+e.message,'bad'); } }
 $('bCanvas').onclick=loadCanvas;
 $('bLoad').onclick=()=>{ if(!SEL) return note('Select a slot first','bad'); locked(()=>run('Loading filament',2001,{canvas_id:SEL.c,tray_id:SEL.t},330000)).then(loadCanvas).catch(()=>{}); };
 $('bUnload').onclick=()=>{ if(!SEL) return note('Select a slot first','bad'); locked(()=>run('Unloading filament',2002,{canvas_id:SEL.c,tray_id:SEL.t},330000)).then(loadCanvas).catch(()=>{}); };
@@ -2071,10 +2215,12 @@ let TAB='files', FILES=[];
 $('tFiles').onclick=()=>{ TAB='files'; $('tFiles').classList.add('sel'); $('tHist').classList.remove('sel'); refresh(); };
 $('tHist').onclick=()=>{ TAB='hist'; $('tHist').classList.add('sel'); $('tFiles').classList.remove('sel'); refresh(); };
 $('bFiles').onclick=()=>refresh();
-async function refresh(){ $('startPanel').style.display='none'; if(TAB==='files') return loadFiles(); return loadHistory(); }
-async function loadFiles(){
-  $('fileBox').innerHTML='<span class="mut">Loading...</span>';
-  try{ const r=await call('files',{},180000); FILES=r.files||[]; renderFiles(); }catch(e){ $('fileBox').innerHTML='<span class="mut">Could not load files: '+esc(e.message)+'</span>'; }
+async function refresh(silent){ if(!silent) $('startPanel').style.display='none'; if(TAB==='files') return loadFiles(silent); return loadHistory(silent); }
+setInterval(()=>{ if(S&&S.code!=null&&!document.hidden){ if(S.code===1) loadCanvas(true); refresh(true); } },60000);
+async function loadFiles(silent){
+  if(!silent||!FILES.length) $('fileBox').innerHTML='<span class="mut">Loading...</span>';
+  try{ const r=await call('files',{},120000); FILES=r.files||[]; if(TAB==='files') renderFiles(); }
+  catch(e){ if(!silent||!FILES.length) $('fileBox').innerHTML='<span class="mut">Could not load files: '+esc(e.message)+'</span>'; }
 }
 function renderFiles(){
   if(!FILES.length){ $('fileBox').innerHTML='<span class="mut">No files on the printer.</span>'; return; }
@@ -2118,18 +2264,23 @@ async function openStart(f){
     p.style.display='none'; try{ await locked(()=>run('Print started','start_file',{filename:f.filename,slots,leveling:$('chkLevel')?$('chkLevel').checked:false},60000)); }catch(e){}
   };
 }
-async function loadHistory(){
-  $('fileBox').innerHTML='<span class="mut">Loading...</span>';
+async function loadHistory(silent){
+  if(!silent) $('fileBox').innerHTML='<span class="mut">Loading...</span>';
   try{
-    const r=await call('history'); const list=r.history_task_list||r.task_list||r.list||[];
+    const r=await call('history',{},60000); const list=r.tasks||[];
+    if(TAB!=='hist') return;
     if(!list.length){ $('fileBox').innerHTML='<span class="mut">No print history.</span>'; return; }
-    const rows=list.map(h=>{
-      const name=h.task_name||h.taskName||h.filename||h.file_name||'-', b=h.begin_time||h.beginTime||h.start_time, e=h.end_time||h.endTime;
-      const st=h.task_status!=null?h.task_status:(h.status!=null?h.status:'');
-      return '<tr><td class="n" title="'+esc(name)+'">'+esc(name)+'</td><td>'+fmtD(b)+'</td><td>'+fmtD(e)+'</td><td>'+esc(st)+'</td></tr>';
-    }).join('');
-    $('fileBox').innerHTML='<table><tr><th>Task</th><th>Started</th><th>Ended</th><th>Status</th></tr>'+rows+'</table>';
-  }catch(e){ $('fileBox').innerHTML='<span class="mut">Could not load history: '+esc(e.message)+'</span>'; }
+    const dur=(b,e)=>{ b=+b; e=+e; if(!b||!e||e<b) return '-'; return fmtS(b>1e12?(e-b)/1000:(e-b)); };
+    const rows=list.map((h,i)=>'<tr><td class="n" title="'+esc(h.name)+'">'+esc(h.name||'-')+'</td><td>'+fmtD(h.begin)+'</td><td>'+fmtD(h.end)+'</td><td>'+dur(h.begin,h.end)+'</td><td><span class="chip" title="Raw status code reported by the printer">'+esc(h.status==null?'-':'status '+h.status)+'</span></td><td><button class="dng" data-hd="'+i+'">Delete</button></td></tr>').join('');
+    $('fileBox').innerHTML='<table><tr><th>Task</th><th>Started</th><th>Ended</th><th>Duration</th><th>Result</th><th></th></tr>'+rows+'</table>'+(r.total>list.length?'<div class="mut" style="margin-top:8px">Showing the latest '+list.length+' of '+esc(r.total)+'.</div>':'');
+    $('fileBox').querySelectorAll('[data-hd]').forEach(b=>b.onclick=()=>askHistDelete(list[+b.dataset.hd]));
+  }catch(e){ if(!silent) $('fileBox').innerHTML='<span class="mut">Could not load history: '+esc(e.message)+'</span>'; }
+}
+function askHistDelete(h){
+  PANEL++; const p=$('startPanel'); p.style.display='block';
+  p.innerHTML='Delete the history entry <b>'+esc(h.name||h.id)+'</b>? <button class="dng" id="yHd">Yes, delete</button> <button id="nHd">No</button>';
+  $('nHd').onclick=()=>{p.style.display='none';};
+  $('yHd').onclick=async()=>{ p.style.display='none'; try{ await run('Deleted','history_delete',{ids:[h.id]}); loadHistory(); }catch(e){} };
 }
 
 if(typeof AgoraRTM==='undefined'){ setChip('cRtm','RTM: SDK not loaded','bad'); L('AgoraRTM script failed to load'); }
