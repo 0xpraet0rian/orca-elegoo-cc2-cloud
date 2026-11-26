@@ -6,7 +6,7 @@
 # name = "Elegoo CC2 Cloud"
 # description = "Send gcode to and control an Elegoo Centauri Carbon 2 from OrcaSlicer through the Elegoo cloud: upload, start/pause/stop, live status. Reuses your ElegooSlicer login (close ElegooSlicer while connected)."
 # author = "personal use"
-# version = "0.3.1"
+# version = "0.3.2"
 # ///
 """
 Elegoo Centauri Carbon 2 - cloud printer agent for OrcaSlicer 2.5.x
@@ -1547,7 +1547,7 @@ class CC2Agent(pa.PrinterAgentBase):
 
     def get_agent_info(self):
         i = pa.AgentInfo()
-        i.id, i.name, i.version = AGENT_ID, "Elegoo CC2 (cloud)", "0.3.1"
+        i.id, i.name, i.version = AGENT_ID, "Elegoo CC2 (cloud)", "0.3.2"
         i.description = "Elegoo Centauri Carbon 2 via the Elegoo cloud"
         return i
 
@@ -1874,6 +1874,31 @@ PAGE_HTML = r"""<!doctype html><meta charset="utf-8">
  #camBar{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
  #camMsg{min-height:18px;margin-top:10px;text-align:center}
  footer{margin-top:26px;padding-top:14px;border-top:1px solid var(--line);font:12px var(--mono);color:var(--dim);display:flex;gap:14px;flex-wrap:wrap;justify-content:space-between}
+
+ /* Orca injects <style id="orca-plugin-defaults"> after this one (html/body colours, headings, button, input/select,
+    th/td). Equal-specificity rules would lose to it, so the base elements are restated with higher specificity. */
+ :root,:root body{background:var(--bg) var(--bgimg) fixed;color:var(--text);font-family:var(--sans);font-size:13px}
+ :root[data-theme="simple-dark"],:root[data-theme="0x"],:root{color-scheme:dark}
+ :root[data-theme="simple-light"]{color-scheme:light}
+ #app h1,#app h2,#app h3,#app h4{color:var(--text);font-weight:650}
+ #app button{font:inherit;font-weight:500;background:var(--panel2);color:var(--text);border:1px solid var(--line);border-radius:10px;padding:5px 13px;filter:none}
+ #app button:hover:not(:disabled){border-color:var(--acc);filter:none}
+ #app button:disabled{opacity:.4;cursor:not-allowed}
+ #app button.pri{background:var(--acc);border-color:var(--acc);color:var(--onacc)}
+ #app button.pri:hover:not(:disabled){background:var(--acc2);border-color:var(--acc2)}
+ #app button.dng{background:transparent;color:var(--bad);border-color:var(--bad)}
+ #app button.dng:hover:not(:disabled){background:var(--bad);color:#fff}
+ #app button.sel{background:var(--acc);border-color:var(--acc);color:var(--onacc)}
+ #app button.ico{padding:3px 8px}
+ #app .pad button,#app .zcol button{padding:0}
+ #app .zcol.hall button{padding:8px 16px}
+ #app input,#app select,#app textarea{font:inherit;background:var(--panel2);color:var(--text);border:1px solid var(--line);border-radius:10px;padding:4px 9px}
+ #app input[type=checkbox],#app input[type=range]{padding:0;background:transparent;border:0}
+ #app input:focus,#app select:focus{outline:none;border-color:var(--acc)}
+ #app table{border-collapse:collapse}
+ #app th,#app td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--line)}
+ #app th{color:var(--dim);font-weight:500}
+ ::-webkit-scrollbar-thumb{background:var(--line)}
 </style>
 
 <div id="app">

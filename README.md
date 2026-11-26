@@ -15,7 +15,7 @@
   <img alt="Python" src="https://img.shields.io/badge/python-3.12%2B-3776ab?style=flat-square">
   <img alt="Platform" src="https://img.shields.io/badge/platform-Windows-0078d4?style=flat-square">
   <img alt="Dependencies" src="https://img.shields.io/badge/dependencies-none-4cc38a?style=flat-square">
-  <img alt="Status" src="https://img.shields.io/badge/status-v0.3%20experimental-f59e0b?style=flat-square">
+  <img alt="Status" src="https://img.shields.io/badge/status-v0.3.2%20experimental-f59e0b?style=flat-square">
 </p>
 
 ---
