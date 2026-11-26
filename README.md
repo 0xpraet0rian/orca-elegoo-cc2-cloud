@@ -29,8 +29,9 @@
 | **Multi-colour** | Filament slots are taken from Orca's mapping and sent as the printer's `slot_map` |
 | **Own sign-in** | Signs in to your Elegoo account with Elegoo's own page, in your browser, through a local pass-through; the session is stored encrypted (Windows DPAPI) |
 | **Control tab** | Print, temperature, motion, fans, light, Canvas filament, files, history and camera in one tab |
-| **Theme** | Dark, light or automatic, in the style of the author's site (orange accent) or a neutral teal; saved between sessions |
+| **Theme** | Simple dark (default), Simple white, or the 0xpraet0rian style (navy and orange); saved between sessions |
 | **Auto-refresh** | Filament slots, files and print history refresh themselves after connecting, when a print ends and every minute |
+| **Camera** | Live view starts by itself when the printer connects (switch off with Auto-start); the picture window is resizable |
 | **No dependencies** | One Python file; the standard library only |
 
 ## Status

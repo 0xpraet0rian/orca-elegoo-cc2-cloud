@@ -6,7 +6,7 @@
 # name = "Elegoo CC2 Cloud"
 # description = "Send gcode to and control an Elegoo Centauri Carbon 2 from OrcaSlicer through the Elegoo cloud: upload, start/pause/stop, live status. Reuses your ElegooSlicer login (close ElegooSlicer while connected)."
 # author = "personal use"
-# version = "0.3.0"
+# version = "0.3.1"
 # ///
 """
 Elegoo Centauri Carbon 2 - cloud printer agent for OrcaSlicer 2.5.x
@@ -520,21 +520,23 @@ PREFS_FILE = os.path.join(_DATA, "cc2_prefs.json")
 OPEN_OK = ("https://0xpraet0rian.github.io/", "https://github.com/0xpraet0rian")
 
 
+THEMES = ("simple-dark", "simple-light", "0x")
+
+
 def _prefs_get():
     try:
         d = json.loads(_read_bytes(PREFS_FILE).decode("utf-8"))
     except Exception:
         d = {}
-    return {"mode": d.get("mode") if d.get("mode") in ("auto", "dark", "light") else "auto",
-            "style": d.get("style") if d.get("style") in ("0x", "orca") else "0x"}
+    return {"theme": d.get("theme") if d.get("theme") in THEMES else "simple-dark", "cam": d.get("cam") is not False}
 
 
-def _prefs_set(mode, style):
+def _prefs_set(theme=None, cam=None):
     d = _prefs_get()
-    if mode in ("auto", "dark", "light"):
-        d["mode"] = mode
-    if style in ("0x", "orca"):
-        d["style"] = style
+    if theme in THEMES:
+        d["theme"] = theme
+    if cam is not None:
+        d["cam"] = bool(cam)
     os.makedirs(os.path.dirname(PREFS_FILE), exist_ok=True)
     with open(PREFS_FILE, "w", encoding="utf-8") as f:
         json.dump(d, f)
@@ -884,7 +886,7 @@ class Hub:
         if m == "prefs_get":
             return _prefs_get()
         if m == "prefs_set":
-            return _prefs_set(p.get("mode"), p.get("style"))
+            return _prefs_set(p.get("theme"), p.get("cam"))
         if m == "open_url":
             url = str(p.get("url", ""))
             if url not in OPEN_OK:
@@ -1545,7 +1547,7 @@ class CC2Agent(pa.PrinterAgentBase):
 
     def get_agent_info(self):
         i = pa.AgentInfo()
-        i.id, i.name, i.version = AGENT_ID, "Elegoo CC2 (cloud)", "0.3.0"
+        i.id, i.name, i.version = AGENT_ID, "Elegoo CC2 (cloud)", "0.3.1"
         i.description = "Elegoo Centauri Carbon 2 via the Elegoo cloud"
         return i
 
@@ -1798,13 +1800,16 @@ ICON_SVG = r"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" wid
 
 PAGE_HTML = r"""<!doctype html><meta charset="utf-8">
 <style>
- :root{--radius:16px;--mono:ui-monospace,"JetBrains Mono","Fira Code",SFMono-Regular,Menlo,Consolas,monospace;--sans:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
- :root,:root[data-mode="dark"][data-style="0x"]{--bg:#141b28;--bgimg:radial-gradient(circle at 15% 0%,#1f2c40 0%,#0f151f 60%);--panel:rgba(255,255,255,.06);--panel2:rgba(255,255,255,.1);--line:rgba(255,255,255,.12);
-  --text:#edf1f5;--dim:#9fb0c3;--acc:#ff6600;--acc2:#cc5200;--glow:rgba(255,102,0,.35);--ok:#3ddc97;--bad:#ff6b6b;--warn:#ffb020;--shadow:0 8px 32px rgba(0,0,0,.45);--onacc:#fff;--grid:rgba(255,255,255,.035)}
- :root[data-mode="light"][data-style="0x"]{--bg:#f4f2ee;--bgimg:radial-gradient(circle at 15% 0%,#ffffff 0%,#ebe7e0 70%);--panel:rgba(255,255,255,.85);--panel2:rgba(20,27,40,.06);--line:rgba(20,27,40,.14);
-  --text:#18212f;--dim:#5a6a7d;--acc:#e25a00;--acc2:#b84900;--glow:rgba(226,90,0,.25);--ok:#12805a;--bad:#c9302c;--warn:#9a6300;--shadow:0 6px 24px rgba(20,27,40,.10);--onacc:#fff;--grid:rgba(20,27,40,.05)}
- :root[data-mode="dark"][data-style="orca"]{--bg:#1b1f23;--bgimg:none;--panel:#242a30;--panel2:#2f373e;--line:#38414a;--text:#e7ebef;--dim:#8c98a5;--acc:#14b8a6;--acc2:#0f9488;--glow:rgba(20,184,166,.3);--ok:#35c2b3;--bad:#ef6b5d;--warn:#e0b04a;--shadow:0 2px 10px rgba(0,0,0,.35);--onacc:#06201d;--grid:transparent}
- :root[data-mode="light"][data-style="orca"]{--bg:#f2f4f7;--bgimg:none;--panel:#ffffff;--panel2:#edf1f4;--line:#d9dfe6;--text:#1d2733;--dim:#677485;--acc:#0f766e;--acc2:#0b5f58;--glow:rgba(15,118,110,.22);--ok:#0f766e;--bad:#c0392b;--warn:#b7791f;--shadow:0 1px 3px rgba(16,24,40,.08);--onacc:#fff;--grid:transparent}
+ :root{--mono:ui-monospace,"JetBrains Mono","Fira Code",SFMono-Regular,Menlo,Consolas,monospace;--sans:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+ /* default = simple dark */
+ :root,:root[data-theme="simple-dark"]{--bg:#1c1c1e;--bgimg:none;--panel:#262628;--panel2:#313134;--line:#3d3d41;--text:#ececee;--dim:#9a9aa1;--acc:#4f8cff;--acc2:#3d78e6;--glow:rgba(79,140,255,.28);
+  --ok:#4cc38a;--bad:#ff6b6b;--warn:#e6b450;--shadow:none;--onacc:#fff;--grid:transparent;--bf:none;--radius:12px}
+ :root[data-theme="simple-light"]{--bg:#f4f4f6;--bgimg:none;--panel:#ffffff;--panel2:#eeeef1;--line:#dcdce1;--text:#1c1c1e;--dim:#66666e;--acc:#2563eb;--acc2:#1d4fc4;--glow:rgba(37,99,235,.2);
+  --ok:#168a5a;--bad:#c9302c;--warn:#9a6300;--shadow:none;--onacc:#fff;--grid:transparent;--bf:none;--radius:12px}
+ /* 0xpraet0rian: navy with a faint grid, orange accent, glass panels (the author's site) */
+ :root[data-theme="0x"]{--bg:#141b28;--bgimg:radial-gradient(circle at 15% 0%,#1f2c40 0%,#0f151f 60%);--panel:rgba(255,255,255,.06);--panel2:rgba(255,255,255,.1);--line:rgba(255,255,255,.12);
+  --text:#edf1f5;--dim:#9fb0c3;--acc:#ff6600;--acc2:#cc5200;--glow:rgba(255,102,0,.35);--ok:#3ddc97;--bad:#ff6b6b;--warn:#ffb020;--shadow:0 8px 32px rgba(0,0,0,.45);--onacc:#fff;
+  --grid:rgba(255,255,255,.035);--bf:blur(18px) saturate(140%);--radius:16px}
  *{box-sizing:border-box}
  html,body{margin:0;width:100%;min-height:100%}
  body{font:13px/1.5 var(--sans);color:var(--text);background:var(--bg) var(--bgimg) fixed;position:relative}
@@ -1813,7 +1818,7 @@ PAGE_HTML = r"""<!doctype html><meta charset="utf-8">
  h3{margin:0;font:650 14px var(--sans);color:var(--text);letter-spacing:.01em}
  .mut{color:var(--dim)} b{font-weight:600} a{color:var(--acc);text-decoration:none;cursor:pointer} a:hover{text-decoration:underline}
  .top{display:flex;gap:16px;align-items:center;flex-wrap:wrap;margin-bottom:18px}
- .top svg{flex:none;border-radius:12px;box-shadow:0 0 0 1px var(--line),0 6px 18px var(--glow)}
+ .top svg{flex:none;border-radius:12px}
  .top .name{font-size:26px;font-weight:700;line-height:1.1;letter-spacing:-.01em}
  .right{margin-left:auto;display:flex;flex-direction:column;align-items:flex-end;gap:8px}
  .chips{display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end}
@@ -1824,7 +1829,7 @@ PAGE_HTML = r"""<!doctype html><meta charset="utf-8">
  .chip.warn{border-color:var(--warn);color:var(--warn)} .chip.warn::before{background:var(--warn);opacity:1}
  .themebar{display:flex;gap:6px;align-items:center;font:12px var(--mono);color:var(--dim)}
  .cols{display:grid;gap:16px;grid-template-columns:repeat(auto-fit,minmax(min(100%,480px),1fr));align-items:stretch;transition:opacity .2s}
- .card{display:flex;flex-direction:column;background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:16px 18px;box-shadow:var(--shadow);backdrop-filter:blur(18px) saturate(140%);-webkit-backdrop-filter:blur(18px) saturate(140%)}
+ .card{display:flex;flex-direction:column;background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:16px 18px;box-shadow:var(--shadow);backdrop-filter:var(--bf);-webkit-backdrop-filter:var(--bf)}
  .card>h3{display:flex;align-items:center;gap:0;margin-bottom:14px;min-height:28px}
  .card>h3>*:first-child{margin-left:auto}
  .card>h3 .mut{font:500 12px var(--sans)}
@@ -1844,6 +1849,7 @@ PAGE_HTML = r"""<!doctype html><meta charset="utf-8">
  .k{font:11px var(--mono);text-transform:uppercase;letter-spacing:.06em;color:var(--dim)} .v{font-weight:650;font-size:16px}
  .pad{display:grid;grid-template-columns:repeat(3,48px);grid-template-rows:repeat(3,42px);gap:6px} .pad button{padding:0}
  .zcol{display:flex;flex-direction:column;gap:6px} .zcol button{width:48px;height:42px;padding:0}
+ .zcol.hall button{width:auto;height:auto;min-width:92px;min-height:42px;padding:8px 16px;white-space:nowrap}
  .slots{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:12px;margin:6px 0}
  .slot{border:2px solid var(--line);border-radius:14px;padding:12px 6px;text-align:center;cursor:pointer;background:var(--panel2);transition:border-color .12s,box-shadow .12s}
  .slot:hover{border-color:var(--acc)} .slot.on{border-color:var(--acc);box-shadow:0 0 0 4px var(--glow)}
@@ -1854,7 +1860,7 @@ PAGE_HTML = r"""<!doctype html><meta charset="utf-8">
  td.n{max-width:420px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--mono);font-size:12px}
  .tabs{display:flex;gap:6px;align-items:center} .dots i{display:inline-block;width:11px;height:11px;border-radius:50%;margin-right:3px;border:1px solid #0004}
  .toolbar{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;flex-wrap:wrap;gap:8px}
- #note{position:sticky;top:8px;z-index:5;margin:0 0 14px;padding:10px 16px;border-radius:12px;display:none;border:1px solid var(--line);background:var(--panel);box-shadow:var(--shadow);backdrop-filter:blur(18px)}
+ #note{position:sticky;top:8px;z-index:5;margin:0 0 14px;padding:10px 16px;border-radius:12px;display:none;border:1px solid var(--line);background:var(--panel);box-shadow:var(--shadow);backdrop-filter:var(--bf)}
  #note.bad{border-color:var(--bad);color:var(--bad)} #note.ok{border-color:var(--ok);color:var(--ok)}
  .cols.off{opacity:.36;pointer-events:none;filter:grayscale(.6)}
  .panel{border:1px dashed var(--acc);border-radius:12px;padding:12px 14px;margin:10px 0;background:var(--panel2)}
@@ -1873,13 +1879,12 @@ PAGE_HTML = r"""<!doctype html><meta charset="utf-8">
 <div id="app">
 <div id="note"></div>
 <div class="top">
-  <svg width="46" height="46" viewBox="0 0 128 128" aria-hidden="true"><rect width="128" height="128" rx="26" fill="#ff6600"/><path transform="translate(0 4)" d="M40 58a15 15 0 0 1 14-20 20 20 0 0 1 37 6 13 13 0 0 1-1 26H44a12 12 0 0 1-4-12z" fill="#fff3e8"/><rect x="34" y="66" width="60" height="44" rx="5" fill="none" stroke="#fff" stroke-width="5"/><line x1="34" y1="80" x2="94" y2="80" stroke="#fff" stroke-width="4"/><rect x="58" y="76" width="12" height="9" rx="2" fill="#ffd2b0"/><path d="M61 85h6l-3 6z" fill="#ffd2b0"/></svg>
+  <svg width="46" height="46" viewBox="0 0 128 128" aria-hidden="true"><rect width="128" height="128" rx="26" style="fill:var(--acc)"/><path transform="translate(0 4)" d="M40 58a15 15 0 0 1 14-20 20 20 0 0 1 37 6 13 13 0 0 1-1 26H44a12 12 0 0 1-4-12z" fill="#fff3e8"/><rect x="34" y="66" width="60" height="44" rx="5" fill="none" stroke="#fff" stroke-width="5"/><line x1="34" y1="80" x2="94" y2="80" stroke="#fff" stroke-width="4"/><rect x="58" y="76" width="12" height="9" rx="2" fill="#ffd2b0"/><path d="M61 85h6l-3 6z" fill="#ffd2b0"/></svg>
   <div><div class="name" id="pname">Elegoo CC2</div><div class="mut" id="pinfo"></div></div>
   <div class="right">
     <div class="chips"><span class="chip" id="cRtm">RTM: starting</span><span class="chip" id="cPr">Printer: -</span><span class="chip" id="cSt">-</span></div>
     <div class="themebar"><span>theme</span>
-      <select id="thMode" title="Dark, light or follow the system"><option value="auto">auto</option><option value="dark">dark</option><option value="light">light</option></select>
-      <select id="thStyle" title="Colour style"><option value="0x">0xpraet0rian</option><option value="orca">orca teal</option></select></div>
+      <select id="thTheme" title="Colour theme"><option value="simple-dark">Simple dark</option><option value="simple-light">Simple white</option><option value="0x">0xpraet0rian</option></select></div>
   </div>
 </div>
 
@@ -1937,7 +1942,7 @@ PAGE_HTML = r"""<!doctype html><meta charset="utf-8">
         <span></span><button data-mv="y-">Y-</button><span></span>
       </div>
       <div class="zcol"><button data-mv="z+" title="Increase Z">Z+</button><button id="bHz" title="Home Z">Z</button><button data-mv="z-" title="Decrease Z">Z-</button></div>
-      <div class="zcol"><button id="bHall" title="Home all axes" style="height:auto;padding:8px 10px">Home<br>all</button></div>
+      <div class="zcol hall"><button id="bHall" title="Home all axes">Home all</button></div>
     </div>
     <div class="mut" id="homedNote"></div>
   </div>
@@ -1951,7 +1956,7 @@ PAGE_HTML = r"""<!doctype html><meta charset="utf-8">
   </div>
 
   <div class="card" style="grid-column:1/-1">
-    <h3>Camera <span id="camBar"><span class="tabs" id="camSizes" style="display:none"><button data-w="360">S</button><button data-w="560">M</button><button data-w="800">L</button><button data-w="0" title="Fit the card width">Fit</button><button id="bFull" title="Full screen">Full screen</button></span> <button id="bCam" class="pri">Turn on</button></span></h3>
+    <h3>Camera <span id="camBar"><label class="sw" title="Start the camera by itself when the printer connects"><input type="checkbox" id="camAuto"> Auto-start</label> <span class="tabs" id="camSizes" style="display:none"><button data-w="360">S</button><button data-w="560">M</button><button data-w="800">L</button><button data-w="0" title="Fit the card width">Fit</button><button id="bFull" title="Full screen">Full screen</button></span> <button id="bCam" class="pri">Turn on</button></span></h3>
     <div id="camWrap" title="Drag the bottom-right corner to resize"><div id="camBox"></div></div>
     <div class="mut" id="camMsg">Live view from the printer camera (needs the cloud account; one viewer per account). Drag the bottom-right corner of the picture to resize it.</div>
   </div>
@@ -2039,7 +2044,7 @@ const num=v=>(+v)|0;
 /* ---------- live state ---------- */
 let FIRST=true;
 function autoHooks(prev,m){
-  if(FIRST){ FIRST=false; setTimeout(()=>{ loadCanvas(true); refresh(true); },400); }
+  if(FIRST){ FIRST=false; setTimeout(()=>{ loadCanvas(true); refresh(true); },400); if(PREFS.cam!==false) setTimeout(()=>{ if(!CAMON&&!$('bCam').disabled) camStart(); },1500); }
   if(prev&&prev.code===2&&m.code!==2) setTimeout(()=>{ refresh(true); loadCanvas(true); },2500);   // a print just ended
   if(prev&&prev.code!==1&&m.code===1) setTimeout(()=>loadCanvas(true),1500);                       // back to idle (filament ops etc.)
 }
@@ -2081,7 +2086,7 @@ async function handle(m){
   else if(m.type==='logs') (m.lines||[]).forEach(L);
   else if(m.type==='info'){ $('pname').textContent=m.name||'Elegoo CC2'; $('pinfo').textContent=[m.model,'firmware '+(m.fw||'?'),'LAN IP '+(m.ip||'?'),'SN '+(m.sn||'?')].join('  |  '); }
   else if(m.type==='note'){ note(m.text,m.kind); }
-  else if(m.type==='prefs'){ PREFS={mode:m.mode||'auto',style:m.style||'0x'}; applyTheme(); }
+  else if(m.type==='prefs'){ PREFS={theme:m.theme||'simple-dark',cam:m.cam!==false}; applyTheme(); }
   else if(m.type==='connstat'){ const e=$('aStat'); e.textContent=m.text; e.style.color=m.kind==='bad'?'var(--bad)':(m.kind==='ok'?'var(--ok)':''); }
   else if(m.type==='account'){ renderAccount(m); }
   else if(m.type==='conn'){ setChip('cPr','Printer: '+(m.printer?'online':'offline'),m.printer?'ok':'bad'); if(m.msg) note(m.msg,m.printer?'ok':'bad'); if(!m.printer){ $('ctl').classList.add('off'); $('ctlHint').style.display='block'; $('aStat').textContent=m.msg||'Printer is offline in the Elegoo cloud'; $('aStat').style.color='var(--bad)'; } }
@@ -2094,16 +2099,11 @@ setInterval(()=>P({type:'pull'}),300);
 
 /* ---------- controls ---------- */
 /* ---------- theme, links ---------- */
-let PREFS={mode:'auto',style:'0x'};
-const mq=window.matchMedia?matchMedia('(prefers-color-scheme: dark)'):null;
-function applyTheme(){
-  const dark=PREFS.mode==='dark'||(PREFS.mode==='auto'&&(!mq||mq.matches));
-  document.documentElement.dataset.mode=dark?'dark':'light'; document.documentElement.dataset.style=PREFS.style==='orca'?'orca':'0x';
-  $('thMode').value=PREFS.mode; $('thStyle').value=PREFS.style;
-}
-if(mq&&mq.addEventListener) mq.addEventListener('change',()=>{ if(PREFS.mode==='auto') applyTheme(); });
-function setPrefs(){ PREFS={mode:$('thMode').value,style:$('thStyle').value}; applyTheme(); call('prefs_set',PREFS).catch(()=>{}); }
-$('thMode').onchange=setPrefs; $('thStyle').onchange=setPrefs; applyTheme();
+let PREFS={theme:'simple-dark',cam:true};
+function applyTheme(){ const t=['simple-dark','simple-light','0x'].includes(PREFS.theme)?PREFS.theme:'simple-dark'; document.documentElement.dataset.theme=t; $('thTheme').value=t; $('camAuto').checked=PREFS.cam!==false; }
+$('thTheme').onchange=()=>{ PREFS.theme=$('thTheme').value; applyTheme(); call('prefs_set',PREFS).catch(()=>{}); };
+$('camAuto').onchange=()=>{ PREFS.cam=$('camAuto').checked; call('prefs_set',PREFS).catch(()=>{}); };
+applyTheme();
 document.addEventListener('click',e=>{ const a=e.target.closest&&e.target.closest('[data-open]'); if(a){ e.preventDefault(); call('open_url',{url:a.dataset.open}).catch(()=>note('Could not open the link','bad')); } });
 
 /* ---------- account ---------- */
