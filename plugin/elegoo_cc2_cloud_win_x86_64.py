@@ -2298,12 +2298,9 @@ PAGE_HTML = r"""<!doctype html><meta charset="utf-8">
  .pager{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-top:14px}
  #app button.pg{min-width:32px;padding:3px 9px}
 
- .help{padding:0}
- .help>summary{cursor:pointer;padding:12px 18px;font:650 13px var(--sans);list-style:none;color:var(--text);display:flex;align-items:center;gap:10px}
- .help>summary::-webkit-details-marker{display:none}
- .help>summary::before{content:"";width:0;height:0;border-left:6px solid var(--acc);border-top:5px solid transparent;border-bottom:5px solid transparent;transition:transform .15s}
- .help[open]>summary::before{transform:rotate(90deg)}
- .helpbody{padding:0 18px 14px;display:block}
+ .modalbg{position:fixed;inset:0;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;padding:16px;z-index:50}
+ .modal{background:var(--panel);color:var(--text);border:1px solid var(--line);border-radius:var(--radius);box-shadow:0 20px 60px rgba(0,0,0,.5);max-width:640px;width:100%;max-height:86vh;overflow:auto;padding:16px 20px}
+ .mhead{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;font-size:15px}
  .helpbody ol{margin:4px 0 10px;padding-left:22px}
  .helpbody li{margin:6px 0;line-height:1.5}
  .helpbody code{font-family:var(--mono);background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:0 5px}
@@ -2340,7 +2337,7 @@ PAGE_HTML = r"""<!doctype html><meta charset="utf-8">
   <div><div class="name" id="pname">Elegoo CC2</div><div class="mut" id="pinfo"></div></div>
   <div class="right">
     <div class="chips"><span class="chip" id="cRtm">RTM: starting</span><span class="chip" id="cPr">Printer: -</span><span class="chip" id="cSt">-</span></div>
-    <div class="themebar"><span>theme</span>
+    <div class="themebar"><button id="bGuide" title="How to print from Orca">Guide</button><span>theme</span>
       <select id="thTheme" title="Colour theme"><option value="simple-dark">Simple dark</option><option value="simple-light">Simple white</option><option value="0x">0xpraet0rian</option></select></div>
   </div>
 </div>
@@ -2362,8 +2359,8 @@ PAGE_HTML = r"""<!doctype html><meta charset="utf-8">
   </div>
 </div>
 
-<details class="card help" id="help" style="margin-bottom:12px">
-  <summary>How to print from Orca</summary>
+<div id="guideBg" class="modalbg" style="display:none"><div class="modal" role="dialog" aria-label="How to print from Orca">
+  <div class="mhead"><b>How to print from Orca</b><button id="gClose" class="ico" title="Close">&#10005;</button></div>
   <div class="helpbody">
     <ol>
       <li><b>Sign in</b> above and wait for <i>cloud link: online</i>. Keep this tab open while you print: it holds the connection to the printer.</li>
@@ -2379,7 +2376,7 @@ PAGE_HTML = r"""<!doctype html><meta charset="utf-8">
     <div class="mut" style="margin-top:6px"><b>If it fails:</b> check <i>Command console</i> for the failing step. &quot;Another session&quot; means ElegooSlicer or an old tab is still connected;
       &quot;offline in the cloud&quot; means the printer is off or has no Wi-Fi. Close ElegooSlicer while this plugin is connected.</div>
   </div>
-</details>
+</div></div>
 
 <div id="ctlHint" class="mut" style="margin:4px 2px 10px">Connect to the Elegoo cloud (Account above) to see and control the printer.</div>
 <div class="cols off" id="ctl">
@@ -2601,6 +2598,10 @@ setInterval(()=>P({type:'pull'}),300);
 /* ---------- theme, links ---------- */
 let PREFS={theme:'simple-dark',cam:true,autostart:true};
 function applyTheme(){ const t=['simple-dark','simple-light','0x'].includes(PREFS.theme)?PREFS.theme:'simple-dark'; document.documentElement.dataset.theme=t; $('thTheme').value=t; $('camAuto').checked=PREFS.cam!==false; $('autoPrint').checked=PREFS.autostart!==false; try{ scheduleDraw(); }catch(e){} }
+$('bGuide').onclick=()=>{ $('guideBg').style.display='flex'; };
+$('gClose').onclick=()=>{ $('guideBg').style.display='none'; };
+$('guideBg').addEventListener('click',e=>{ if(e.target===$('guideBg')) $('guideBg').style.display='none'; });
+document.addEventListener('keydown',e=>{ if(e.key==='Escape') $('guideBg').style.display='none'; });
 $('thTheme').onchange=()=>{ PREFS.theme=$('thTheme').value; applyTheme(); call('prefs_set',PREFS).catch(()=>{}); };
 $('autoPrint').onchange=()=>{ PREFS.autostart=$('autoPrint').checked; call('prefs_set',PREFS).catch(()=>{}); };
 $('camAuto').onchange=()=>{ PREFS.cam=$('camAuto').checked; call('prefs_set',PREFS).catch(()=>{}); };
