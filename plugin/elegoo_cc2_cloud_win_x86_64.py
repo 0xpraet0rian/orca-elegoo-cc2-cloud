@@ -28,6 +28,7 @@ import collections
 import ctypes
 import ctypes.wintypes as wt
 import hashlib
+import io
 import json
 import os
 import threading
@@ -69,24 +70,101 @@ def _dpapi(data: bytes) -> bytes:
 
 
 def _elegoo_user() -> dict:
-    with open(USER_INFO, "rb") as f:
-        return json.loads(_dpapi(f.read()).decode("utf-8"))
+    return json.loads(_dpapi(_read_bytes(USER_INFO)).decode("utf-8"))
 
 
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, *a, **k):  # never forward the bearer token to a redirect target
-        return None
+_wh = ctypes.WinDLL("winhttp", use_last_error=True)
+_k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+_vp = ctypes.c_void_p
+_wh.WinHttpOpen.restype = _vp
+_wh.WinHttpOpen.argtypes = [wt.LPCWSTR, wt.DWORD, wt.LPCWSTR, wt.LPCWSTR, wt.DWORD]
+_wh.WinHttpConnect.restype = _vp
+_wh.WinHttpConnect.argtypes = [_vp, wt.LPCWSTR, wt.WORD, wt.DWORD]
+_wh.WinHttpOpenRequest.restype = _vp
+_wh.WinHttpOpenRequest.argtypes = [_vp, wt.LPCWSTR, wt.LPCWSTR, wt.LPCWSTR, wt.LPCWSTR, _vp, wt.DWORD]
+_wh.WinHttpSendRequest.argtypes = [_vp, wt.LPCWSTR, wt.DWORD, _vp, wt.DWORD, wt.DWORD, _vp]
+_wh.WinHttpWriteData.argtypes = [_vp, _vp, wt.DWORD, ctypes.POINTER(wt.DWORD)]
+_wh.WinHttpReceiveResponse.argtypes = [_vp, _vp]
+_wh.WinHttpQueryHeaders.argtypes = [_vp, wt.DWORD, wt.LPCWSTR, _vp, ctypes.POINTER(wt.DWORD), _vp]
+_wh.WinHttpReadData.argtypes = [_vp, _vp, wt.DWORD, ctypes.POINTER(wt.DWORD)]
+_wh.WinHttpSetTimeouts.argtypes = [_vp, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+_wh.WinHttpSetOption.argtypes = [_vp, wt.DWORD, _vp, wt.DWORD]
+_wh.WinHttpCloseHandle.argtypes = [_vp]
+_k32.CreateFileW.restype = _vp
+_k32.CreateFileW.argtypes = [wt.LPCWSTR, wt.DWORD, wt.DWORD, _vp, wt.DWORD, wt.DWORD, _vp]
+_k32.ReadFile.argtypes = [_vp, _vp, wt.DWORD, ctypes.POINTER(wt.DWORD), _vp]
+_k32.GetFileSizeEx.argtypes = [_vp, ctypes.POINTER(ctypes.c_longlong)]
+_k32.CloseHandle.argtypes = [_vp]
 
 
-_OPENER = urllib.request.build_opener(_NoRedirect)
+def _read_bytes(path):
+    h = _k32.CreateFileW(path, 0x80000000, 1 | 2, None, 3, 0x80, None)
+    if h in (None, ctypes.c_void_p(-1).value):
+        raise OSError("cannot open %s (error %d)" % (os.path.basename(path), ctypes.get_last_error()))
+    try:
+        size = ctypes.c_longlong()
+        _k32.GetFileSizeEx(h, ctypes.byref(size))
+        buf = (ctypes.c_char * size.value)()
+        got, done = wt.DWORD(), 0
+        while done < size.value:
+            n = min(1 << 24, size.value - done)
+            if not _k32.ReadFile(h, ctypes.byref(buf, done), n, ctypes.byref(got), None) or got.value == 0:
+                raise OSError("read error")
+            done += got.value
+        return bytes(buf)
+    finally:
+        _k32.CloseHandle(h)
 
 
 def _http(method, url, headers=None, data=None, timeout=30):
+    """Returns (status, body). No redirects followed (the bearer token must not leave the host)."""
+    u = urllib.parse.urlsplit(url)
+    secure = u.scheme == "https"
+    port = u.port or (443 if secure else 80)
+    path = (u.path or "/") + (("?" + u.query) if u.query else "")
     h = {"User-Agent": UA}
     h.update(headers or {})
-    req = urllib.request.Request(url, data=data, method=method, headers=h)
-    with _OPENER.open(req, timeout=timeout) as r:
-        return r.status, r.read()
+    hdr = "".join("%s: %s\r\n" % (k, v) for k, v in h.items())
+    ses = _wh.WinHttpOpen("Mozilla/5.0", 0, None, None, 0)
+    if not ses:
+        raise OSError("WinHttpOpen failed")
+    con = req = None
+    try:
+        ms = int(timeout * 1000)
+        _wh.WinHttpSetTimeouts(ses, 15000, 15000, ms, ms)
+        con = _wh.WinHttpConnect(ses, u.hostname, port, 0)
+        req = _wh.WinHttpOpenRequest(con, method, path, None, None, None, 0x800000 if secure else 0)
+        if not (con and req):
+            raise OSError("WinHTTP request setup failed (%d)" % ctypes.get_last_error())
+        off = wt.DWORD(0x80)  # WINHTTP_DISABLE_REDIRECTS
+        _wh.WinHttpSetOption(req, 63, ctypes.byref(off), 4)
+        total = len(data) if data else 0
+        if not _wh.WinHttpSendRequest(req, hdr, 0xFFFFFFFF, None, 0, total, None):
+            raise OSError("WinHTTP send failed (%d)" % ctypes.get_last_error())
+        if total:
+            sent, w = 0, wt.DWORD()
+            mv = memoryview(data)
+            while sent < total:
+                chunk = bytes(mv[sent:sent + (1 << 20)])
+                if not _wh.WinHttpWriteData(req, chunk, len(chunk), ctypes.byref(w)):
+                    raise OSError("WinHTTP write failed (%d)" % ctypes.get_last_error())
+                sent += w.value
+        if not _wh.WinHttpReceiveResponse(req, None):
+            raise OSError("WinHTTP receive failed (%d)" % ctypes.get_last_error())
+        code, sz = wt.DWORD(), wt.DWORD(4)
+        _wh.WinHttpQueryHeaders(req, 19 | 0x20000000, None, ctypes.byref(code), ctypes.byref(sz), None)
+        out, avail = [], wt.DWORD()
+        buf = ctypes.create_string_buffer(65536)
+        while True:
+            rd = wt.DWORD()
+            if not _wh.WinHttpReadData(req, buf, 65536, ctypes.byref(rd)) or rd.value == 0:
+                break
+            out.append(buf.raw[:rd.value])
+        return code.value, b"".join(out)
+    finally:
+        for hnd in (req, con, ses):
+            if hnd:
+                _wh.WinHttpCloseHandle(hnd)
 
 
 def _num(v, default=0.0):
@@ -105,10 +183,11 @@ def _api(path, params=None):
     if not tok:
         raise RuntimeError("No ElegooSlicer token found; sign in to ElegooSlicer first.")
     url = BASE + path + (("?" + urllib.parse.urlencode(params)) if params else "")
-    try:
-        _, body = _http("GET", url, {"Authorization": "Bearer " + tok})
-    except urllib.error.HTTPError as e:
-        raise RuntimeError("Elegoo cloud HTTP %s (token expired? sign in again in ElegooSlicer)" % e.code)
+    status, body = _http("GET", url, {"Authorization": "Bearer " + tok})
+    if status in (401, 403):
+        raise RuntimeError("Elegoo cloud HTTP %s (token expired? sign in again in ElegooSlicer)" % status)
+    if status != 200:
+        raise RuntimeError("Elegoo cloud HTTP %s" % status)
     j = json.loads(body)
     if j.get("code") != 0:
         raise RuntimeError("Elegoo cloud error %s %s" % (j.get("code"), j.get("msg")))
@@ -434,18 +513,14 @@ HUB = Hub()
 
 
 # --------------------------------------------------------------------------- upload + print
-def upload_gcode(path, name, progress=None, cancel_fn=None):
-    """OSS upload via biz-entrypoint; returns (accessUrl, md5hex)."""
-    size = os.path.getsize(path)
+def upload_gcode(data, name, progress=None, cancel_fn=None):
+    """OSS upload via biz-entrypoint from bytes; returns (accessUrl, md5hex)."""
+    size = len(data)
     if size == 0:
         raise RuntimeError("empty file")
     if size >= 500 * 1024 * 1024:
         raise RuntimeError("file >= 500 MB: multipart upload not implemented in v0.1")
-    h = hashlib.md5()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            h.update(chunk)
-    raw = h.digest()
+    raw = hashlib.md5(data).digest()
     md5b64, md5hex = base64.b64encode(raw).decode(), raw.hex()
     d = _api("/api/v1/device-management-server/oss/biz-entrypoint",
              {"filename": name, "bucketAlias": "iot-private", "module": "gcode", "fileMd5": md5b64})
@@ -453,8 +528,6 @@ def upload_gcode(path, name, progress=None, cancel_fn=None):
         progress(10)
     if cancel_fn and cancel_fn():
         raise RuntimeError("cancelled")
-    with open(path, "rb") as f:
-        data = f.read()
     status, _ = _http("PUT", d["entrypoint"], {"Content-Type": "application/octet-stream",
                                                 "Content-MD5": md5b64}, data=data, timeout=900)
     if not 200 <= status < 300:
@@ -474,15 +547,7 @@ def _remote_name(p):
 def _send_to_printer(p, update_fn, cancel_fn):
     name = _remote_name(p)
     cb = lambda pct: update_fn and update_fn(ST_UPLOAD, pct, "Uploading to Elegoo cloud")
-    gpath, tmp = _plate_gcode(p)
-    try:
-        url, md5hex = upload_gcode(gpath, name, cb, cancel_fn)
-    finally:
-        if tmp:
-            try:
-                os.remove(gpath)
-            except OSError:
-                pass
+    url, md5hex = upload_gcode(_plate_gcode(p), name, cb, cancel_fn)
     task = uuid.uuid4().hex
     update_fn and update_fn(ST_SEND, 0, "Printer is downloading the file")
     try:
@@ -566,24 +631,20 @@ def _in_plugin_thread(fn):
 
 
 def _plate_gcode(p):
-    """Orca may hand over a .gcode.3mf (zip). Extract the plate's gcode; return (path, is_temp)."""
-    path = p.filename
-    with open(path, "rb") as f:
-        head = f.read(2)
-    HUB.log("send file: %s (%s)" % (os.path.basename(path), "zip/3mf" if head == b"PK" else "plain"))
-    if head != b"PK":
-        return path, False
+    """Read the file Orca hands over. If it is a .gcode.3mf (zip), return the plate's gcode bytes."""
+    data = _read_bytes(p.filename)
+    is_zip = data[:2] == b"PK"
+    HUB.log("send file: %s (%s, %d bytes)" % (os.path.basename(p.filename), "zip/3mf" if is_zip else "plain", len(data)))
+    if not is_zip:
+        return data
     idx = int(_num(getattr(p, "plate_index", 1), 1)) or 1
-    with zipfile.ZipFile(path) as z:
+    with zipfile.ZipFile(io.BytesIO(data)) as z:
         names = z.namelist()
         want = [n for n in names if n.lower() == "metadata/plate_%d.gcode" % idx] or \
                [n for n in names if n.lower().startswith("metadata/plate_") and n.lower().endswith(".gcode")]
         if not want:
             raise RuntimeError("no plate gcode inside the 3mf")
-        out = os.path.join(tempfile.gettempdir(), "cc2_%s.gcode" % uuid.uuid4().hex[:8])
-        with z.open(want[0]) as src, open(out, "wb") as dst:
-            dst.write(src.read())
-    return out, True
+        return z.read(want[0])
 
 
 # --------------------------------------------------------------------------- agent
@@ -854,6 +915,19 @@ PAGE_HTML = r"""<!doctype html><meta charset="utf-8">
 <div class="row">RTM: <b id="rtm">starting</b> &nbsp; Printer: <b id="st">-</b> <span id="det"></span></div>
 <div class="row"><button id="b">Connect / reconnect</button><span style="color:var(--orca-muted,#999)">Close ElegooSlicer while connected (one session per account).</span></div>
 <pre id="log"></pre>
+<script>
+// The page lives on an opaque origin inside Orca: localStorage/sessionStorage throw. Give the SDK in-memory ones.
+(function(){
+  function mem(){ const m=new Map(); return {
+    getItem:k=>m.has(String(k))?m.get(String(k)):null, setItem:(k,v)=>{m.set(String(k),String(v));},
+    removeItem:k=>{m.delete(String(k));}, clear:()=>m.clear(), key:i=>Array.from(m.keys())[i]??null,
+    get length(){return m.size;} }; }
+  for(const n of ['localStorage','sessionStorage']){
+    let ok=true; try{ void window[n]; }catch(e){ ok=false; }
+    if(!ok){ try{ Object.defineProperty(window,n,{value:mem(),configurable:true}); }catch(e){} }
+  }
+})();
+</script>
 <script src="https://cdn.jsdelivr.net/npm/agora-rtm@2.3.0/agora-rtm.js"></script>
 <script>
 const $=id=>document.getElementById(id); let rtm=null, C=null, GEN=0, off=null;
