@@ -1688,11 +1688,11 @@ def _in_plugin_thread(fn):
     return box.get("r")
 
 
-def _plate_gcode(p):
+def _plate_gcode(p, data=None):
     """Read the file Orca hands over. If it is a .gcode.3mf (zip), return the plate's gcode bytes."""
-    data = _read_bytes(p.filename)
+    data = data if data is not None else _read_bytes(p.filename)
     is_zip = data[:2] == b"PK"
-    HUB.log("send file: %s (%s, %d bytes)" % (os.path.basename(p.filename), "zip/3mf" if is_zip else "plain", len(data)))
+    HUB.log("send file: %s (%s, %d bytes)" % (os.path.basename(p.filename or "orca"), "zip/3mf" if is_zip else "plain", len(data)))
     if not is_zip:
         return data
     idx = int(_num(getattr(p, "plate_index", 1), 1)) or 1
@@ -1703,6 +1703,169 @@ def _plate_gcode(p):
         if not want:
             raise RuntimeError("no plate gcode inside the 3mf")
         return z.read(want[0])
+
+
+
+# --------------------------------------------------------------------------- local "Elegoo Link" bridge
+# Orca's own Elegoo Link host speaks plain HTTP to a CC2 on the LAN: GET /system/info and chunked PUT /upload
+# (1 MiB parts with Content-Range, X-File-Name, X-File-MD5, X-Token). This loopback server answers those two calls
+# and forwards the finished file to the Elegoo cloud, so Orca's normal Print button works with the cloud printer.
+BRIDGE_PORT = 47890
+
+
+class LanBridge(LoginProxy):
+    def __init__(self, log):
+        LoginProxy.__init__(self, None, log)
+        self.parts = {}          # (name, md5) -> bytearray
+        self.lock2 = threading.Lock()
+
+    def start(self):
+        _wsa()
+        for port in (BRIDGE_PORT, 0):
+            s = _ws.socket(2, 1, 6)
+            if s == _INVALID_SOCK:
+                raise OSError("socket failed (%d)" % ctypes.get_last_error())
+            sa = _SockAddrIn(2, ((port & 0xFF) << 8) | (port >> 8), (ctypes.c_ubyte * 4)(127, 0, 0, 1))
+            if _ws.bind(s, ctypes.byref(sa), ctypes.sizeof(sa)) == 0 and _ws.listen(s, 16) == 0:
+                n = ctypes.c_int(ctypes.sizeof(sa))
+                _ws.getsockname(s, ctypes.byref(sa), ctypes.byref(n))
+                self.port = ((sa.port & 0xFF) << 8) | (sa.port >> 8)
+                self.sock = s
+                threading.Thread(target=self._accept_loop, daemon=True, name="cc2-bridge").start()
+                return self.port
+            _ws.closesocket(s)
+        raise OSError("bridge: cannot bind a loopback port")
+
+    def _json(self, c, obj, status=200, reason="OK"):
+        self._reply(c, status, json.dumps(obj).encode(), [("Content-Type", "application/json")], reason=reason)
+
+    def _serve(self, c):
+        try:
+            to = ctypes.c_int(60000)
+            _ws.setsockopt(c, 0xFFFF, 0x1006, ctypes.byref(to), 4)
+            data = b""
+            while b"\r\n\r\n" not in data and len(data) < 65536:
+                chunk = self._recv(c)
+                if not chunk:
+                    return
+                data += chunk
+            head, _, rest = data.partition(b"\r\n\r\n")
+            lines = head.decode("latin-1").split("\r\n")
+            method, target, _v = lines[0].split(" ", 2)
+            hdrs = {}
+            for ln in lines[1:]:
+                if ":" in ln:
+                    k, v = ln.split(":", 1)
+                    hdrs[k.strip().lower()] = v.strip()
+            if hdrs.get("host", "").split(":")[0] not in ("127.0.0.1", "localhost"):     # DNS-rebinding protection
+                return self._reply(c, 403, b"forbidden", reason="Forbidden")
+            need = int(hdrs.get("content-length", "0") or 0)
+            if need > 2 * 1024 * 1024:
+                return self._reply(c, 413, b"too large", reason="Payload Too Large")
+            body = rest
+            while len(body) < need:
+                chunk = self._recv(c)
+                if not chunk:
+                    return
+                body += chunk
+            body = body[:need]
+            path = target.split("?", 1)[0]
+            if method == "GET" and path.rstrip("/") == "/system/info":
+                sn = HUB.sn or SESSION.get().get("sn", "") or "ELEGOO-CLOUD"
+                return self._json(c, {"error_code": 0, "message": "OK", "system_info": {"sn": sn}})
+            if method in ("PUT", "POST") and path.rstrip("/") == "/upload":
+                return self._upload(c, hdrs, body)
+            return self._json(c, {"error_code": -1, "message": "not supported by the cloud bridge"}, 404, "Not Found")
+        except Exception as e:  # noqa
+            try:
+                self.log("bridge: %r" % e)
+                self._json(c, {"error_code": -1, "message": str(e)[:200]}, 500, "Error")
+            except Exception:
+                pass
+        finally:
+            try:
+                _ws.shutdown(c, 2)
+                _ws.closesocket(c)
+            except Exception:
+                pass
+
+    def _upload(self, c, hdrs, body):
+        import re
+        raw_name = hdrs.get("x-file-name", "") or "print.gcode"
+        try:
+            raw_name = raw_name.encode("latin-1").decode("utf-8")
+        except Exception:
+            pass
+        from urllib.parse import unquote
+        name = unquote(raw_name) if "%" in raw_name else raw_name
+        name = os.path.basename(name.replace("\\", "/")) or "print.gcode"
+        name = "".join(ch if (ch.isalnum() or ch in "._- ()") else "_" for ch in name)
+        if not name.lower().endswith(".gcode"):
+            name += ".gcode"
+        md5 = hdrs.get("x-file-md5", "").lower()
+        m = re.match(r"bytes\s+(\d+)-(\d+)/(\d+)", hdrs.get("content-range", ""))
+        if not m:
+            return self._json(c, {"error_code": -1, "message": "missing Content-Range"}, 400, "Bad Request")
+        a, b, total = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        key = (name, md5)
+        with self.lock2:
+            buf = self.parts.setdefault(key, bytearray())
+            if a == 0:
+                del buf[:]
+                self.log("bridge: receiving %s (%.1f MB) from Orca" % (name, total / 1048576.0))
+            if a != len(buf):
+                self.parts.pop(key, None)
+                return self._json(c, {"error_code": -1, "message": "chunk out of order"}, 409, "Conflict")
+            buf += body
+            done = b + 1 >= total and len(buf) >= total
+            data = bytes(self.parts.pop(key)) if done else None
+        if not done:
+            return self._json(c, {"error_code": 0, "message": "OK"})
+        HUB.tl.src = "orca"
+        t0 = time.time()
+        try:
+            if data[:2] == b"PK":
+                import types
+                data = _plate_gcode(types.SimpleNamespace(filename=None, plate_index=1), data)
+            if md5 and hashlib.md5(data).hexdigest() != md5 and data[:2] != b"PK":
+                self.log("bridge: MD5 differs from Orca's header (continuing)")
+            self._to_cloud(name, data)
+        except Exception as e:
+            HUB._log_entry("Orca upload", name, False, str(e), (time.time() - t0) * 1000)
+            HUB.log("bridge upload failed: %s" % e)
+            return self._json(c, {"error_code": -1, "message": str(e)[:200]})
+        HUB._log_entry("Orca upload", "%s (%.1f MB)" % (name, len(data) / 1048576.0), True, "", (time.time() - t0) * 1000)
+        HUB._post({"type": "note", "text": "Received %s from Orca - press Print on it in Printer files" % name, "kind": "ok"})
+        return self._json(c, {"error_code": 0, "message": "OK"})
+
+    def _to_cloud(self, name, data):
+        url, md5hex = upload_gcode(data, name)
+        task = uuid.uuid4().hex
+        HUB.request(1057, {"filename": name, "url": url, "md5": md5hex, "taskID": task}, timeout=30)
+        t0 = last = time.time()
+        try:
+            while time.time() - t0 < 150:      # Orca waits at most ~180 s per request
+                d = HUB.downloads.get(task)
+                if d and _num(d.get("progress")) >= 100:
+                    return
+                if d and d.get("error_code") not in (0, None):
+                    raise RuntimeError("printer download failed (error %s)" % d.get("error_code"))
+                time.sleep(1)
+        finally:
+            HUB.downloads.pop(task, None)
+
+
+BRIDGE = None
+
+
+def _start_bridge():
+    global BRIDGE
+    try:
+        BRIDGE = LanBridge(HUB.log)
+        port = BRIDGE.start()
+        HUB.log("Orca bridge listening on 127.0.0.1:%d (Elegoo Link host)" % port)
+    except Exception as e:
+        HUB.log("Orca bridge not started: %s" % e)
 
 
 # --------------------------------------------------------------------------- agent
@@ -2627,3 +2790,4 @@ class ElegooCC2Plugin(orca.base):
             HUB.log("request_permissions failed: %r" % e)
         orca.register_capability(CC2Page)
         orca.register_capability(CC2Agent)
+        _start_bridge()
