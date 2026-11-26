@@ -127,13 +127,13 @@ def _read_bytes(path):
         _k32.CloseHandle(h)
 
 
-def _http(method, url, headers=None, data=None, timeout=30):
-    """Returns (status, body). No redirects followed (the bearer token must not leave the host)."""
+def _http_full(method, url, headers=None, data=None, timeout=30, user_agent=None):
+    """Returns (status, [(header, value)...], body). No redirects, no automatic cookies."""
     u = urllib.parse.urlsplit(url)
     secure = u.scheme == "https"
     port = u.port or (443 if secure else 80)
     path = (u.path or "/") + (("?" + u.query) if u.query else "")
-    h = {"User-Agent": UA}
+    h = {"User-Agent": user_agent or UA}
     h.update(headers or {})
     hdr = "".join("%s: %s\r\n" % (k, v) for k, v in h.items())
     ses = _wh.WinHttpOpen("Mozilla/5.0", 4, None, None, 0) or _wh.WinHttpOpen("Mozilla/5.0", 0, None, None, 0)
@@ -147,7 +147,7 @@ def _http(method, url, headers=None, data=None, timeout=30):
         req = _wh.WinHttpOpenRequest(con, method, path, None, None, None, 0x800000 if secure else 0)
         if not (con and req):
             raise OSError("WinHTTP request setup failed (%d)" % ctypes.get_last_error())
-        off = wt.DWORD(0x2)  # WINHTTP_DISABLE_REDIRECTS (via WINHTTP_OPTION_DISABLE_FEATURE = 63)
+        off = wt.DWORD(0x3)  # WINHTTP_DISABLE_COOKIES | WINHTTP_DISABLE_REDIRECTS (option 63)
         if not _wh.WinHttpSetOption(req, 63, ctypes.byref(off), 4):
             raise OSError("cannot disable redirects (%d)" % ctypes.get_last_error())
         total = len(data) if data else 0
@@ -165,7 +165,19 @@ def _http(method, url, headers=None, data=None, timeout=30):
             raise OSError("WinHTTP receive failed (%d)" % ctypes.get_last_error())
         code, sz = wt.DWORD(), wt.DWORD(4)
         _wh.WinHttpQueryHeaders(req, 19 | 0x20000000, None, ctypes.byref(code), ctypes.byref(sz), None)
-        out, avail = [], wt.DWORD()
+        raw = ""
+        sz2 = wt.DWORD(0)
+        _wh.WinHttpQueryHeaders(req, 22, None, None, ctypes.byref(sz2), None)   # size probe (raw CRLF headers)
+        if sz2.value:
+            hb = ctypes.create_unicode_buffer(sz2.value // 2 + 2)
+            if _wh.WinHttpQueryHeaders(req, 22, None, hb, ctypes.byref(sz2), None):
+                raw = hb.value
+        pairs = []
+        for ln in raw.split("\r\n")[1:]:
+            if ":" in ln:
+                k, v = ln.split(":", 1)
+                pairs.append((k.strip(), v.strip()))
+        out = []
         buf = ctypes.create_string_buffer(65536)
         while True:
             rd = wt.DWORD()
@@ -174,11 +186,260 @@ def _http(method, url, headers=None, data=None, timeout=30):
             if rd.value == 0:
                 break
             out.append(buf.raw[:rd.value])
-        return code.value, b"".join(out)
+        return code.value, pairs, b"".join(out)
     finally:
         for hnd in (req, con, ses):
             if hnd:
                 _wh.WinHttpCloseHandle(hnd)
+
+
+def _http(method, url, headers=None, data=None, timeout=30):
+    """Returns (status, body)."""
+    st, _h, body = _http_full(method, url, headers, data, timeout)
+    return st, body
+
+
+# --------------------------------------------------------------------------- local sign-in pass-through
+# Orca ignores the sign-in page's native-bridge messages, so the official page is served to the user's browser
+# through a tiny loopback server that adds the bridge ("window.wx") the page expects. Built on ctypes (Winsock +
+# WinHTTP) because Orca audits Python sockets/urllib. Request bodies (including the password) are forwarded in
+# memory only: nothing is logged or stored except the session the page reports after a successful login.
+_ws = ctypes.WinDLL("ws2_32", use_last_error=True)
+_SOCK = ctypes.c_size_t
+_INVALID_SOCK = _SOCK(-1).value
+
+
+class _SockAddrIn(ctypes.Structure):
+    _fields_ = [("family", ctypes.c_short), ("port", ctypes.c_ushort),
+                ("addr", ctypes.c_ubyte * 4), ("zero", ctypes.c_ubyte * 8)]
+
+
+_ws.socket.restype = _SOCK
+_ws.socket.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int]
+_ws.bind.argtypes = [_SOCK, ctypes.c_void_p, ctypes.c_int]
+_ws.listen.argtypes = [_SOCK, ctypes.c_int]
+_ws.accept.restype = _SOCK
+_ws.accept.argtypes = [_SOCK, ctypes.c_void_p, ctypes.c_void_p]
+_ws.getsockname.argtypes = [_SOCK, ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
+_ws.recv.restype = ctypes.c_int
+_ws.recv.argtypes = [_SOCK, ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+_ws.send.restype = ctypes.c_int
+_ws.send.argtypes = [_SOCK, ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+_ws.closesocket.argtypes = [_SOCK]
+_ws.connect.restype = ctypes.c_int
+_ws.connect.argtypes = [_SOCK, ctypes.c_void_p, ctypes.c_int]
+_ws.shutdown.argtypes = [_SOCK, ctypes.c_int]
+_ws.setsockopt.argtypes = [_SOCK, ctypes.c_int, ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
+_WSA_READY = []
+
+
+def _wsa():
+    if not _WSA_READY:
+        _ws.WSAStartup(0x0202, ctypes.create_string_buffer(512))
+        _WSA_READY.append(1)
+
+
+def _open_url(url):
+    """Open a URL in the default browser without Python process APIs (not audited)."""
+    r = ctypes.windll.shell32.ShellExecuteW(None, "open", url, None, None, 1)
+    if r <= 32:
+        raise OSError("cannot open the browser (%d)" % r)
+
+
+class LoginProxy:
+    UPSTREAM = "https://account.elegoo.com"
+    DROP_RESP = {"transfer-encoding", "content-length", "connection", "content-security-policy",
+                 "content-security-policy-report-only", "x-frame-options", "strict-transport-security",
+                 "alt-svc", "report-to", "nel", "keep-alive"}
+    DROP_REQ = {"host", "origin", "referer", "connection", "content-length", "accept-encoding", "keep-alive",
+                "upgrade-insecure-requests", "transfer-encoding", "te", "proxy-connection"}
+
+    def __init__(self, on_msg, log):
+        self.on_msg, self.log = on_msg, log
+        self.sock = None
+        self.port = 0
+        self.nonce = uuid.uuid4().hex
+        self.stopped = False
+
+    # ---- lifecycle
+    def start(self):
+        _wsa()
+        s = _ws.socket(2, 1, 6)
+        if s == _INVALID_SOCK:
+            raise OSError("socket failed (%d)" % ctypes.get_last_error())
+        sa = _SockAddrIn(2, 0, (ctypes.c_ubyte * 4)(127, 0, 0, 1))
+        if _ws.bind(s, ctypes.byref(sa), ctypes.sizeof(sa)) != 0 or _ws.listen(s, 32) != 0:
+            _ws.closesocket(s)
+            raise OSError("bind/listen failed (%d)" % ctypes.get_last_error())
+        n = ctypes.c_int(ctypes.sizeof(sa))
+        _ws.getsockname(s, ctypes.byref(sa), ctypes.byref(n))
+        self.port = ((sa.port & 0xFF) << 8) | (sa.port >> 8)
+        self.sock = s
+        threading.Thread(target=self._accept_loop, daemon=True, name="cc2-proxy").start()
+        return self.port
+
+    def stop(self):
+        if self.stopped:
+            return
+        self.stopped = True
+        try:  # wake the blocking accept() with a throw-away loopback connection
+            w = _ws.socket(2, 1, 6)
+            sa = _SockAddrIn(2, ((self.port & 0xFF) << 8) | (self.port >> 8), (ctypes.c_ubyte * 4)(127, 0, 0, 1))
+            _ws.connect(w, ctypes.byref(sa), ctypes.sizeof(sa))
+            _ws.closesocket(w)
+        except Exception:
+            pass
+
+    def _accept_loop(self):
+        s = self.sock
+        try:
+            while not self.stopped:
+                c = _ws.accept(s, None, None)
+                if c == _INVALID_SOCK:
+                    break
+                if self.stopped:
+                    _ws.closesocket(c)
+                    break
+                threading.Thread(target=self._serve, args=(c,), daemon=True, name="cc2-proxy-conn").start()
+        finally:
+            self.sock = None
+            _ws.closesocket(s)
+
+    # ---- socket helpers
+    @staticmethod
+    def _recv(c, n=65536):
+        buf = ctypes.create_string_buffer(n)
+        got = _ws.recv(c, buf, n, 0)
+        return buf.raw[:got] if got > 0 else b""
+
+    @staticmethod
+    def _send_all(c, data):
+        mv, off = memoryview(data), 0
+        while off < len(data):
+            chunk = bytes(mv[off:off + 65536])
+            n = _ws.send(c, chunk, len(chunk), 0)
+            if n <= 0:
+                return False
+            off += n
+        return True
+
+    def _reply(self, c, status, body=b"", headers=None, reason="OK", head=False):
+        h = [("Content-Length", str(len(body))), ("Connection", "close"), ("Cache-Control", "no-store")]
+        h += list(headers or [])
+        out = ("HTTP/1.1 %d %s\r\n" % (status, reason) + "".join("%s: %s\r\n" % kv for kv in h) + "\r\n").encode("latin-1", "replace")
+        self._send_all(c, out + (b"" if head else body))
+
+    # ---- request handling
+    def _serve(self, c):
+        try:
+            to = ctypes.c_int(20000)
+            _ws.setsockopt(c, 0xFFFF, 0x1006, ctypes.byref(to), 4)  # SO_RCVTIMEO
+            data = b""
+            while b"\r\n\r\n" not in data and len(data) < 65536:
+                chunk = self._recv(c)
+                if not chunk:
+                    return
+                data += chunk
+            head, _, rest = data.partition(b"\r\n\r\n")
+            lines = head.decode("latin-1").split("\r\n")
+            try:
+                method, target, _ver = lines[0].split(" ", 2)
+            except ValueError:
+                return self._reply(c, 400, b"bad request", reason="Bad Request")
+            hdrs = {}
+            for ln in lines[1:]:
+                if ":" in ln:
+                    k, v = ln.split(":", 1)
+                    hdrs[k.strip().lower()] = v.strip()
+            if hdrs.get("host", "") != "127.0.0.1:%d" % self.port:       # DNS-rebinding protection
+                return self._reply(c, 403, b"forbidden", reason="Forbidden")
+            if hdrs.get("transfer-encoding"):
+                return self._reply(c, 411, b"length required", reason="Length Required")
+            need = int(hdrs.get("content-length", "0") or 0)
+            if need > 4 * 1024 * 1024 or not target.startswith("/"):
+                return self._reply(c, 400, b"bad request", reason="Bad Request")
+            body = rest
+            while len(body) < need:
+                chunk = self._recv(c)
+                if not chunk:
+                    return
+                body += chunk
+            body = body[:need]
+            path = target.split("#", 1)[0]
+            if path.split("?", 1)[0] == "/__wx/" + self.nonce and method == "POST":
+                return self._wx(c, body)
+            self._proxy(c, method, path, hdrs, body)
+        except Exception as e:  # noqa
+            try:
+                self.log("proxy: %r" % e)
+                self._reply(c, 502, b"proxy error", reason="Bad Gateway")
+            except Exception:
+                pass
+        finally:
+            try:
+                _ws.shutdown(c, 2)
+                _ws.closesocket(c)
+            except Exception:
+                pass
+
+    def _wx(self, c, body):
+        try:
+            m = json.loads(body.decode("utf-8"))
+            if isinstance(m, dict):
+                self.on_msg(m)
+        except Exception:
+            pass
+        self._reply(c, 200, b"{}", [("Content-Type", "application/json")])
+
+    SHIM = """<script>(function(){var N="__NONCE__";
+function rep(id,m,code,msg,data){setTimeout(function(){try{window.HandleStudio&&window.HandleStudio({id:id,method:m,type:'response',code:code,message:msg,data:data});}catch(e){}},0);}
+window.wx={postMessage:function(s){var m;try{m=JSON.parse(s);}catch(e){return;}
+ if(!m||m.type!=='request')return;
+ var forward=true;
+ if(forward){fetch('/__wx/'+N,{method:'POST',headers:{'Content-Type':'application/json'},body:s}).then(function(){rep(m.id,m.method,0,'success',{});}).catch(function(){rep(m.id,m.method,1,'failed',null);});}
+ else{rep(m.id,m.method,0,'success',{});}}};})();</script>"""
+
+    def _proxy(self, c, method, path, hdrs, body):
+        origin = "http://127.0.0.1:%d" % self.port
+        fwd = {}
+        for k, v in hdrs.items():
+            if k in self.DROP_REQ or k.startswith("sec-fetch") or k.startswith("sec-ch"):
+                continue
+            fwd[k] = v
+        fwd["Accept-Encoding"] = "identity"
+        if "origin" in hdrs:
+            fwd["Origin"] = self.UPSTREAM
+        if "referer" in hdrs:
+            fwd["Referer"] = hdrs["referer"].replace(origin, self.UPSTREAM)
+        fwd.pop("user-agent", None)
+        status, rh, rb = _http_full(method, self.UPSTREAM + path, fwd, body or None, timeout=30,
+                                    user_agent=hdrs.get("user-agent") or UA)
+        ctype, out_h = "", []
+        for k, v in rh:
+            lk = k.lower()
+            if lk in self.DROP_RESP:
+                continue
+            if lk == "content-type":
+                ctype = v
+            if lk == "location":
+                v = v.replace(self.UPSTREAM, origin)
+            elif lk == "set-cookie":
+                parts = [p.strip() for p in v.split(";")]
+                parts = [p for p in parts if not p.lower().startswith(("domain=", "samesite=")) and p.lower() != "secure"]
+                v = "; ".join(parts + ["SameSite=Lax"])
+            out_h.append((k, v))
+        enc = any(k.lower() == "content-encoding" for k, _ in rh)
+        text = ("html" in ctype or "javascript" in ctype or "json" in ctype or "css" in ctype or "svg" in ctype) and not enc
+        if text:
+            s = rb.decode("utf-8", "replace").replace(self.UPSTREAM, origin)
+            if "html" in ctype:
+                shim = self.SHIM.replace("__NONCE__", self.nonce)
+                i = s.lower().find("<head>")
+                s = (s[:i + 6] + shim + s[i + 6:]) if i >= 0 else (shim + s)
+            rb = s.encode("utf-8")
+        reason = {200: "OK", 204: "No Content", 301: "Moved Permanently", 302: "Found", 304: "Not Modified",
+                  400: "Bad Request", 401: "Unauthorized", 403: "Forbidden", 404: "Not Found"}.get(status, "OK")
+        self._reply(c, status, rb, out_h, reason=reason, head=(method == "HEAD"))
 
 
 def _num(v, default=0.0):
@@ -282,6 +543,11 @@ def _api(path, params=None):
     if status != 200:
         raise RuntimeError("Elegoo cloud HTTP %s" % status)
     j = json.loads(body)
+    if j.get("code") in (401, 30010, 30012):
+        SESSION.update(token="", refreshToken="")
+        HUB._push_account()
+        raise RuntimeError("Your Elegoo session is no longer valid (password changed or signed out elsewhere): "
+                           "sign in again in the Elegoo CC2 tab.")
     if j.get("code") != 0:
         raise RuntimeError("Elegoo cloud error %s %s" % (j.get("code"), j.get("msg")))
     return j.get("data")
@@ -322,7 +588,7 @@ class Hub:
         self.out_status = None                      # only the latest status matters
         self.printer_online = True
         self.devices = []
-        self.login_win = None
+        self.login_proxy = None
         self.rtc = None
         self.cur_code = None
         self.status_ts = 0.0
@@ -532,8 +798,7 @@ class Hub:
                 raise RuntimeError("no camera credentials for this printer")
             return dict(self.rtc)
         if m == "acct_login":
-            orca.host.ui  # fails early if the UI API is missing
-            self.open_login_window()
+            self.start_browser_login()
             return {"started": True}
         if m == "acct_import":
             self.import_from_elegooslicer()
@@ -651,21 +916,26 @@ class Hub:
     def _push_account(self):
         self._post(dict(self.account_state(), type="account"))
 
-    def open_login_window(self):
+    def start_browser_login(self):
         d = SESSION.get()
         dev_id = d.get("deviceId") or uuid.uuid4().hex
         if not d.get("deviceId"):
             SESSION.update(deviceId=dev_id)
-        url = LOGIN_URL % ("global", "light", dev_id)
-        html = ('<!doctype html><meta charset="utf-8"><body style="font-family:sans-serif;padding:20px">'
-                '<p>Opening the Elegoo sign-in page...</p><script>location.replace(%s)</script>' % json.dumps(url))
-        ui = orca.host.ui
-        self.log("sign-in window opening (Elegoo account page)")
-        self.login_win = ui.create_window(html=html, title="Sign in to Elegoo",
-                                          on_message=self._on_login_msg, on_close=self._on_login_close)
+        self._stop_login_proxy()
+        px = LoginProxy(self._on_login_msg, self.log)
+        port = px.start()
+        self.login_proxy = px
+        url = "http://127.0.0.1:%d/account/slicer-login?region=global&theme=light&deviceId=%s" % (port, dev_id)
+        _open_url(url)
+        self.log("sign-in page opened in your browser (local pass-through on 127.0.0.1:%d)" % port)
+        t = threading.Timer(900, self._stop_login_proxy)
+        t.daemon = True
+        t.start()
 
-    def _on_login_close(self, *a):
-        self.login_win = None
+    def _stop_login_proxy(self):
+        px, self.login_proxy = self.login_proxy, None
+        if px:
+            px.stop()
 
     def _on_login_msg(self, data):
         """Messages from the Elegoo sign-in page (same bridge ElegooSlicer uses). Only method names are logged."""
@@ -679,7 +949,7 @@ class Hub:
             elif m == "report.websiteOpen":
                 url = str(_dict(data.get("params")).get("url", ""))
                 if url.startswith("https://"):
-                    threading.Thread(target=lambda: os.startfile(url), daemon=True).start()
+                    threading.Thread(target=lambda: _open_url(url), daemon=True).start()
         except Exception as e:
             self.log("sign-in message error: %r" % e)
 
@@ -694,12 +964,9 @@ class Hub:
                           "nickname": u.get("nickname", ""), "deviceId": keep.get("deviceId", ""),
                           "source": "own", "sn": keep.get("sn", "")})
             self.log("signed in")
-            w = self.login_win
-            if w is not None:
-                try:
-                    w.close()
-                except Exception:
-                    pass
+            t = threading.Timer(5, self._stop_login_proxy)
+            t.daemon = True
+            t.start()
             try:
                 self.fetch_creds()
             except Exception as e:
@@ -723,6 +990,7 @@ class Hub:
         self._push_account()
 
     def sign_out(self):
+        self._stop_login_proxy()
         self.want_poll = False
         self.stop_poll()
         self.was_connected = False
@@ -1435,7 +1703,7 @@ PAGE_HTML = r"""<!doctype html><meta charset="utf-8">
     <div class="row">You are not signed in to the Elegoo cloud.</div>
     <div class="row"><button class="pri" id="bSign">Sign in with Elegoo</button>
       <button id="bImport" title="Reuse the session of the ElegooSlicer installed on this PC (token only, read once)">Use ElegooSlicer session</button></div>
-    <div class="mut">The sign-in page is Elegoo's own; the plugin never sees your password.</div>
+    <div class="mut">Sign-in opens Elegoo's own page in your browser, served through a local connection on this PC. The plugin passes your password to Elegoo in memory only: it is never stored or logged. Only the session Elegoo returns is kept (encrypted).</div>
   </div>
   <div id="aIn" style="display:none">
     <div class="row"><span>Signed in as <b id="aMail"></b></span><span class="mut" id="aSrc"></span><span class="chip" id="aLink">cloud link: offline</span></div>
@@ -1635,7 +1903,7 @@ function renderAccount(a){
   const on=a.rtm; $('aLink').textContent='cloud link: '+(on?'online':'offline'); $('aLink').className='chip '+(on?'ok':'');
 }
 async function loadAccount(){ try{ renderAccount(await call('acct_status')); }catch(e){ note('Account: '+e.message,'bad'); } }
-$('bSign').onclick=()=>run('Opening the Elegoo sign-in window...','acct_login').catch(()=>{});
+$('bSign').onclick=()=>run('Sign-in page opened in your browser','acct_login').catch(()=>{});
 $('bImport').onclick=()=>run('Session imported','acct_import').then(renderAccount).catch(()=>{});
 $('bOut').onclick=()=>run('Signed out','acct_logout').then(renderAccount).catch(()=>{});
 $('aDev').onchange=e=>run('Printer selected','acct_select',{sn:e.target.value}).then(renderAccount).catch(()=>{});
