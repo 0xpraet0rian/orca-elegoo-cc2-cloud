@@ -242,6 +242,29 @@ def _wsa():
         _WSA_READY.append(1)
 
 
+def _pick_gcode():
+    """Windows 'Open' dialog for a .gcode / .gcode.3mf file; returns the path or ''."""
+    class OFN(ctypes.Structure):
+        _fields_ = [("lStructSize", wt.DWORD), ("hwndOwner", wt.HWND), ("hInstance", wt.HINSTANCE),
+                    ("lpstrFilter", wt.LPCWSTR), ("lpstrCustomFilter", wt.LPWSTR), ("nMaxCustFilter", wt.DWORD),
+                    ("nFilterIndex", wt.DWORD), ("lpstrFile", wt.LPWSTR), ("nMaxFile", wt.DWORD),
+                    ("lpstrFileTitle", wt.LPWSTR), ("nMaxFileTitle", wt.DWORD), ("lpstrInitialDir", wt.LPCWSTR),
+                    ("lpstrTitle", wt.LPCWSTR), ("Flags", wt.DWORD), ("nFileOffset", wt.WORD),
+                    ("nFileExtension", wt.WORD), ("lpstrDefExt", wt.LPCWSTR), ("lCustData", wt.LPARAM),
+                    ("lpfnHook", ctypes.c_void_p), ("lpTemplateName", wt.LPCWSTR), ("pvReserved", ctypes.c_void_p),
+                    ("dwReserved", wt.DWORD), ("FlagsEx", wt.DWORD)]
+    buf = ctypes.create_unicode_buffer(1024)
+    o = OFN()
+    o.lStructSize = ctypes.sizeof(OFN)
+    o.lpstrFilter = "G-code (*.gcode;*.3mf)\0*.gcode;*.3mf\0All files\0*.*\0\0"
+    o.lpstrFile, o.nMaxFile = ctypes.cast(buf, wt.LPWSTR), 1024
+    o.lpstrTitle = "Send G-code to the printer"
+    o.Flags = 0x00001000 | 0x00000800 | 0x00080000 | 0x00000008   # FILEMUSTEXIST | PATHMUSTEXIST | EXPLORER | NOCHANGEDIR
+    if not ctypes.windll.comdlg32.GetOpenFileNameW(ctypes.byref(o)):
+        return ""
+    return buf.value
+
+
 def _open_url(url):
     """Open a URL in the default browser without Python process APIs (not audited)."""
     r = ctypes.windll.shell32.ShellExecuteW(None, "open", url, None, None, 1)
@@ -975,6 +998,20 @@ class Hub:
             return self.request(2005, {}, timeout=15)
         if m == "history":
             return self._history_http(int(_num(p.get("page"), 1)), int(_num(p.get("size"), 10)))
+        if m == "send_local":
+            path = _pick_gcode()
+            if not path:
+                return {"cancelled": True}
+            import types
+            base = os.path.basename(path)
+            for suf in (".gcode.3mf", ".3mf"):
+                if base.lower().endswith(suf):
+                    base = base[:-len(suf)] + ".gcode"
+                    break
+            pp = types.SimpleNamespace(filename=path, dst_file=base, project_name=os.path.splitext(base)[0], plate_index=1)
+            self.tl.src = "tab"
+            name = _send_to_printer(pp, lambda st, pct, msg: self.log("send: %s %s%%" % (msg, pct)), None)
+            return {"name": name}
         if m == "samples_clear":
             with self.data_lock:
                 self.samples.clear()
@@ -2159,7 +2196,7 @@ PAGE_HTML = r"""<!doctype html><meta charset="utf-8">
   </div>
 
   <div class="card" style="grid-column:1/-1">
-    <div class="toolbar"><div class="tabs"><button id="tFiles" class="sel">Printer files</button><button id="tHist">Print history</button></div><button id="bFiles" class="ico" title="Reload (also automatic)">&#8635;</button></div>
+    <div class="toolbar"><div class="tabs"><button id="tFiles" class="sel">Printer files</button><button id="tHist">Print history</button></div><span style="display:flex;gap:8px;align-items:center"><button id="bSend" title="Pick a .gcode exported from Orca and upload it to the printer">Send G-code...</button><button id="bFiles" class="ico" title="Reload (also automatic)">&#8635;</button></span></div>
     <div id="startPanel" class="panel" style="display:none"></div>
     <div id="fileBox"><span class="mut">Reading the file list...</span></div>
   </div>
@@ -2414,6 +2451,7 @@ let TAB='files', FILES=[];
 $('tFiles').onclick=()=>{ TAB='files'; FP.page=1; $('tFiles').classList.add('sel'); $('tHist').classList.remove('sel'); refresh(); };
 $('tHist').onclick=()=>{ TAB='hist'; HP.page=1; $('tHist').classList.add('sel'); $('tFiles').classList.remove('sel'); refresh(); };
 $('bFiles').onclick=()=>refresh();
+$('bSend').onclick=async()=>{ const b=$('bSend'); b.disabled=true; const t=b.textContent; b.textContent='Sending...'; try{ const r=await call('send_local',{},960000); if(r&&r.name){ note('Sent '+r.name+' - press Print on it in the list','ok'); TAB='files'; $('tFiles').classList.add('sel'); $('tHist').classList.remove('sel'); refresh(); } }catch(e){ note('Send failed: '+e.message,'bad'); } finally{ b.disabled=false; b.textContent=t; } };
 async function refresh(silent){ if(!silent) $('startPanel').style.display='none'; if(TAB==='files') return loadFiles(silent); return loadHistory(silent); }
 setInterval(()=>{ if(S&&S.code!=null&&!document.hidden){ if(S.code===1) loadCanvas(true); refresh(true); } },60000);
 async function loadFiles(silent){
