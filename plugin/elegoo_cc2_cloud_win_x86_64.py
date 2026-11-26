@@ -1814,7 +1814,6 @@ PAGE_HTML = r"""<!doctype html><meta charset="utf-8">
  .mut{color:var(--dim)} b{font-weight:600} a{color:var(--acc);text-decoration:none;cursor:pointer} a:hover{text-decoration:underline}
  .top{display:flex;gap:16px;align-items:center;flex-wrap:wrap;margin-bottom:18px}
  .top svg{flex:none;border-radius:12px;box-shadow:0 0 0 1px var(--line),0 6px 18px var(--glow)}
- .prompt{font:12px var(--mono);color:var(--dim)} .prompt b{color:var(--acc);font-weight:600}
  .top .name{font-size:26px;font-weight:700;line-height:1.1;letter-spacing:-.01em}
  .right{margin-left:auto;display:flex;flex-direction:column;align-items:flex-end;gap:8px}
  .chips{display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end}
@@ -1875,7 +1874,7 @@ PAGE_HTML = r"""<!doctype html><meta charset="utf-8">
 <div id="note"></div>
 <div class="top">
   <svg width="46" height="46" viewBox="0 0 128 128" aria-hidden="true"><rect width="128" height="128" rx="26" fill="#ff6600"/><path transform="translate(0 4)" d="M40 58a15 15 0 0 1 14-20 20 20 0 0 1 37 6 13 13 0 0 1-1 26H44a12 12 0 0 1-4-12z" fill="#fff3e8"/><rect x="34" y="66" width="60" height="44" rx="5" fill="none" stroke="#fff" stroke-width="5"/><line x1="34" y1="80" x2="94" y2="80" stroke="#fff" stroke-width="4"/><rect x="58" y="76" width="12" height="9" rx="2" fill="#ffd2b0"/><path d="M61 85h6l-3 6z" fill="#ffd2b0"/></svg>
-  <div><div class="prompt"><b>0x@printer</b>:~$ status</div><div class="name" id="pname">Elegoo CC2</div><div class="mut" id="pinfo"></div></div>
+  <div><div class="name" id="pname">Elegoo CC2</div><div class="mut" id="pinfo"></div></div>
   <div class="right">
     <div class="chips"><span class="chip" id="cRtm">RTM: starting</span><span class="chip" id="cPr">Printer: -</span><span class="chip" id="cSt">-</span></div>
     <div class="themebar"><span>theme</span>
@@ -1973,7 +1972,7 @@ PAGE_HTML = r"""<!doctype html><meta charset="utf-8">
 
 <details style="margin-top:12px"><summary class="mut">Log</summary><pre id="log"></pre></details>
 
-<footer><span><span style="color:var(--acc)">$</span> plugin by <a data-open="https://0xpraet0rian.github.io/">0xpraet0rian</a> &middot; <a data-open="https://github.com/0xpraet0rian">GitHub &#8599;</a> &middot; <a data-open="https://0xpraet0rian.github.io/">portfolio &#8599;</a></span><span>elegoo cc2 cloud &middot; v0.3</span></footer>
+<footer><span>plugin by <a data-open="https://0xpraet0rian.github.io/">0xpraet0rian</a> &middot; <a data-open="https://github.com/0xpraet0rian">GitHub &#8599;</a> &middot; <a data-open="https://0xpraet0rian.github.io/">portfolio &#8599;</a></span><span>elegoo cc2 cloud &middot; v0.3</span></footer>
 </div>
 
 <script>
