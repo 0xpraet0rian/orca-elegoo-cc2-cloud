@@ -1479,7 +1479,7 @@ class Hub:
                     "nozzle": pr["nozzle_temper"], "nozzle_t": pr["nozzle_target_temper"],
                     "bed": pr["bed_temper"], "bed_t": pr["bed_target_temper"], "chamber": pr["chamber_temper"],
                     "layer": pr["layer_num"], "total": pr["total_layer_num"], "left": pr["mc_remaining_time"],
-                    "file": pr["subtask_name"], "x": _num(gm.get("x")), "y": _num(gm.get("y")), "z": _num(gm.get("z")),
+                    "file": pr["subtask_name"], "elapsed": int(_num(ps.get("print_duration"))), "x": _num(gm.get("x")), "y": _num(gm.get("y")), "z": _num(gm.get("z")),
                     "homed": str(th.get("homed_axes", "") or ""), "speed": int(_num(gm.get("speed_mode"), 1)),
                     "model_fan": pc("fan"), "aux_fan": pc("aux_fan"), "case_fan": pc("box_fan"),
                     "light": _num(_dict(s.get("led")).get("status")) == 1})
@@ -1960,9 +1960,10 @@ PAGE_HTML = r"""<!doctype html><meta charset="utf-8">
  .chip.bad{border-color:var(--bad);color:var(--bad)} .chip.bad::before{background:var(--bad);opacity:1}
  .chip.warn{border-color:var(--warn);color:var(--warn)} .chip.warn::before{background:var(--warn);opacity:1}
  .themebar{display:flex;gap:6px;align-items:center;font:12px var(--mono);color:var(--dim)}
- .cols{display:grid;gap:16px;grid-template-columns:1fr;align-items:stretch;transition:opacity .2s}
- @media (min-width:900px){.cols{grid-template-columns:repeat(2,minmax(0,1fr))}}
- @media (min-width:1900px){.cols{grid-template-columns:repeat(4,minmax(0,1fr))}}
+ .cols{display:flex;flex-direction:column;gap:16px;transition:opacity .2s}
+ .split{display:grid;grid-template-columns:1fr;gap:16px;align-items:start}
+ .col{display:flex;flex-direction:column;gap:16px;min-width:0}
+ @media (min-width:900px){.split{grid-template-columns:repeat(2,minmax(0,1fr))}}
  .card{display:flex;flex-direction:column;background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:16px 18px;box-shadow:var(--shadow);backdrop-filter:var(--bf);-webkit-backdrop-filter:var(--bf)}
  .card>h3{display:flex;align-items:center;gap:0;margin-bottom:14px;min-height:28px}
  .card>h3>*:first-child{margin-left:auto}
@@ -1979,7 +1980,7 @@ PAGE_HTML = r"""<!doctype html><meta charset="utf-8">
  input[type=range]{accent-color:var(--acc);width:100%} input[type=checkbox]{accent-color:var(--acc)}
  .row{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:7px 0}
  .bar{height:10px;border-radius:6px;background:var(--panel2);overflow:hidden} .bar>i{display:block;height:100%;background:linear-gradient(90deg,var(--acc2),var(--acc));width:0%;transition:width .4s;box-shadow:0 0 12px var(--glow)}
- .kv{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin:14px 0} .kv div{display:flex;flex-direction:column}
+ .kv{display:grid;grid-template-columns:repeat(auto-fit,minmax(90px,1fr));gap:10px;margin:14px 0} .kv div{display:flex;flex-direction:column}
  .k{font:11px var(--mono);text-transform:uppercase;letter-spacing:.06em;color:var(--dim)} .v{font-weight:650;font-size:16px}
  .pad{display:grid;grid-template-columns:repeat(3,48px);grid-template-rows:repeat(3,42px);gap:6px} .pad button{padding:0}
  .zcol{display:flex;flex-direction:column;gap:6px} .zcol button{width:48px;height:42px;padding:0}
@@ -2009,6 +2010,8 @@ PAGE_HTML = r"""<!doctype html><meta charset="utf-8">
  #camMsg{min-height:18px;margin-top:10px;text-align:center}
  footer{margin-top:26px;padding-top:14px;border-top:1px solid var(--line);font:12px var(--mono);color:var(--dim);display:flex;gap:14px;flex-wrap:wrap;justify-content:space-between}
 
+ .posbox{margin-left:auto;display:grid;gap:6px;min-width:170px;padding:12px 16px;border:1px solid var(--line);border-radius:12px;background:var(--panel2)}
+ .posbox>div:not(.k){display:flex;justify-content:space-between;gap:18px;font:16px var(--mono)}
  .rangeb{display:inline-flex;gap:6px;align-items:center}
  .graphs{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,460px),1fr));gap:18px}
  .gbox{position:relative} .gbox canvas{width:100%;height:180px;display:block}
@@ -2079,12 +2082,15 @@ PAGE_HTML = r"""<!doctype html><meta charset="utf-8">
 
 <div id="ctlHint" class="mut" style="margin:4px 2px 10px">Connect to the Elegoo cloud (Account above) to see and control the printer.</div>
 <div class="cols off" id="ctl">
+  <div class="split">
+  <div class="col">
   <div class="card" id="cPrint">
     <h3>Print <span class="mut" id="pFile"></span></h3>
     <div class="bar"><i id="pBar"></i></div>
     <div class="kv">
       <div><span class="k">Progress</span><span class="v" id="vPg">-</span></div>
       <div><span class="k">Layer</span><span class="v" id="vLy">-</span></div>
+      <div><span class="k">Elapsed</span><span class="v" id="vEl">-</span></div>
       <div><span class="k">Remaining</span><span class="v" id="vLf">-</span></div>
     </div>
     <div class="row">
@@ -2097,16 +2103,7 @@ PAGE_HTML = r"""<!doctype html><meta charset="utf-8">
   </div>
 
   <div class="card">
-    <h3>Temperature <span class="rangeb"><button data-r="300000">5 min</button><button data-r="1800000" class="sel">30 min</button><button data-r="7200000">2 h</button><button class="gclear" title="Forget the recorded points">Clear</button></span></h3>
-    <div class="row"><span style="width:70px">Nozzle</span><b id="tNz">-</b><span class="mut">/</span><input type="number" id="iNz" min="0" max="350" placeholder="0"><button id="bNz">Set</button><button id="bNz0">Off</button></div>
-    <div class="row"><span style="width:70px">Bed</span><b id="tBd">-</b><span class="mut">/</span><input type="number" id="iBd" min="0" max="120" placeholder="0"><button id="bBd">Set</button><button id="bBd0">Off</button></div>
-    <div class="row"><span style="width:70px">Chamber</span><b id="tCh">-</b></div>
-    <div class="legend" id="lgT" style="margin-top:10px"></div><div class="gbox"><canvas id="cT"></canvas><div class="tip" id="tipT"></div></div>
-    <div class="mut" style="margin-top:6px;font-size:12px">Recorded while the printer is connected; kept while Orca is running.</div>
-  </div>
-
-  <div class="card">
-    <h3>Motion <span class="mut" id="pos">X - Y - Z -</span></h3>
+    <h3>Motion</h3>
     <div class="row"><span class="mut">Step</span>
       <span class="tabs" id="steps"><button data-s="0.1">0.1</button><button data-s="1">1</button><button data-s="10" class="sel">10</button><button data-s="30">30</button><span class="mut">mm</span></span></div>
     <div class="row" style="gap:18px;align-items:flex-start">
@@ -2117,8 +2114,24 @@ PAGE_HTML = r"""<!doctype html><meta charset="utf-8">
       </div>
       <div class="zcol"><button data-mv="z+" title="Increase Z">Z+</button><button id="bHz" title="Home Z">Z</button><button data-mv="z-" title="Decrease Z">Z-</button></div>
       <div class="zcol hall"><button id="bHall" title="Home all axes">Home all</button></div>
+      <div class="posbox"><div class="k">Position (mm)</div><div><span class="mut">X</span><b id="pX">-</b></div><div><span class="mut">Y</span><b id="pY">-</b></div><div><span class="mut">Z</span><b id="pZ">-</b></div></div>
     </div>
     <div class="mut" id="homedNote"></div>
+  </div>
+
+  <div class="card" style="grid-column:1/-1">
+    <h3>Command console <span><button id="bConClear">Clear</button></span></h3>
+    <div class="console" id="console"><span class="mut">Every command sent to the printer shows up here: motion, temperatures, fans, light, speed, filament, files and prints.</span></div>
+  </div>
+  </div>
+  <div class="col">
+  <div class="card">
+    <h3>Temperature <span class="rangeb"><button data-r="300000">5 min</button><button data-r="1800000" class="sel">30 min</button><button data-r="7200000">2 h</button><button class="gclear" title="Forget the recorded points">Clear</button></span></h3>
+    <div class="row"><span style="width:70px">Nozzle</span><b id="tNz">-</b><span class="mut">/</span><input type="number" id="iNz" min="0" max="350" placeholder="0"><button id="bNz">Set</button><button id="bNz0">Off</button></div>
+    <div class="row"><span style="width:70px">Bed</span><b id="tBd">-</b><span class="mut">/</span><input type="number" id="iBd" min="0" max="120" placeholder="0"><button id="bBd">Set</button><button id="bBd0">Off</button></div>
+    <div class="row"><span style="width:70px">Chamber</span><b id="tCh">-</b></div>
+    <div class="legend" id="lgT" style="margin-top:10px"></div><div class="gbox"><canvas id="cT"></canvas><div class="tip" id="tipT"></div></div>
+    <div class="mut" style="margin-top:6px;font-size:12px">Recorded while the printer is connected; kept while Orca is running.</div>
   </div>
 
   <div class="card">
@@ -2129,10 +2142,7 @@ PAGE_HTML = r"""<!doctype html><meta charset="utf-8">
     <div class="row"><label class="sw"><input type="checkbox" id="light"> Overhead light</label></div>
     <div class="legend" id="lgF" style="margin-top:10px"></div><div class="gbox"><canvas id="cF"></canvas><div class="tip" id="tipF"></div></div>
   </div>
-
-  <div class="card" style="grid-column:1/-1">
-    <h3>Command console <span><button id="bConClear">Clear</button></span></h3>
-    <div class="console" id="console"><span class="mut">Every command sent to the printer shows up here: motion, temperatures, fans, light, speed, filament, files and prints.</span></div>
+  </div>
   </div>
 
   <div class="card" style="grid-column:1/-1">
@@ -2235,10 +2245,10 @@ function applyStatus(m){
   S=m; const idle=(m.code===1)&&!BUSY, printing=active(m), paused=(m.state==='PAUSE');
   $('cSt').textContent=m.label||m.state; $('cSt').className='chip '+(printing?'ok':(m.code===14?'bad':''));
   $('pFile').textContent=m.file||''; $('pBar').style.width=Math.min(100,m.progress||0)+'%';
-  $('vPg').textContent=(m.progress||0)+'%'; $('vLy').textContent=m.total?(m.layer+' / '+m.total):'-'; $('vLf').textContent=fmtT(m.left);
+  $('vPg').textContent=(m.progress||0)+'%'; $('vLy').textContent=m.total?(m.layer+' / '+m.total):'-'; $('vLf').textContent=fmtT(m.left); $('vEl').textContent=fmtS(m.elapsed);
   $('tNz').textContent=Math.round(m.nozzle)+' C'; $('tBd').textContent=Math.round(m.bed)+' C'; $('tCh').textContent=Math.round(m.chamber)+' C';
   if(document.activeElement!==$('iNz')) $('iNz').placeholder=Math.round(m.nozzle_t||0); if(document.activeElement!==$('iBd')) $('iBd').placeholder=Math.round(m.bed_t||0);
-  $('pos').textContent='X '+(+m.x).toFixed(1)+'  Y '+(+m.y).toFixed(1)+'  Z '+(+m.z).toFixed(1);
+  $('pX').textContent=(+m.x).toFixed(1); $('pY').textContent=(+m.y).toFixed(1); $('pZ').textContent=(+m.z).toFixed(1);
   $('homedNote').textContent=m.homed?('Homed axes: '+m.homed.toUpperCase()):'Not homed: home the axes before moving.';
   for(const [id,k,lab] of [['fModel','model','vModel'],['fAux','aux','vAux'],['fCase','case','vCase']]){
     const rep=m[k+'_fan'], hd=HOLD[id], now=Date.now(), pending=!!hd&&now<hd.until&&rep!==hd.v;
