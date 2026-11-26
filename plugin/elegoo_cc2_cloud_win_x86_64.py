@@ -6,7 +6,7 @@
 # name = "Elegoo CC2 Cloud"
 # description = "Send gcode to and control an Elegoo Centauri Carbon 2 from OrcaSlicer through the Elegoo cloud: upload, start/pause/stop, live status. Reuses your ElegooSlicer login (close ElegooSlicer while connected)."
 # author = "personal use"
-# version = "0.1.0"
+# version = "0.2.0"
 # ///
 """
 Elegoo Centauri Carbon 2 - cloud printer agent for OrcaSlicer 2.5.x
@@ -33,8 +33,6 @@ import json
 import os
 import threading
 import time
-import tempfile
-import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
@@ -138,7 +136,7 @@ def _http(method, url, headers=None, data=None, timeout=30):
     h = {"User-Agent": UA}
     h.update(headers or {})
     hdr = "".join("%s: %s\r\n" % (k, v) for k, v in h.items())
-    ses = _wh.WinHttpOpen("Mozilla/5.0", 0, None, None, 0)
+    ses = _wh.WinHttpOpen("Mozilla/5.0", 4, None, None, 0) or _wh.WinHttpOpen("Mozilla/5.0", 0, None, None, 0)
     if not ses:
         raise OSError("WinHttpOpen failed")
     con = req = None
@@ -149,8 +147,9 @@ def _http(method, url, headers=None, data=None, timeout=30):
         req = _wh.WinHttpOpenRequest(con, method, path, None, None, None, 0x800000 if secure else 0)
         if not (con and req):
             raise OSError("WinHTTP request setup failed (%d)" % ctypes.get_last_error())
-        off = wt.DWORD(0x80)  # WINHTTP_DISABLE_REDIRECTS
-        _wh.WinHttpSetOption(req, 63, ctypes.byref(off), 4)
+        off = wt.DWORD(0x2)  # WINHTTP_DISABLE_REDIRECTS (via WINHTTP_OPTION_DISABLE_FEATURE = 63)
+        if not _wh.WinHttpSetOption(req, 63, ctypes.byref(off), 4):
+            raise OSError("cannot disable redirects (%d)" % ctypes.get_last_error())
         total = len(data) if data else 0
         if not _wh.WinHttpSendRequest(req, hdr, 0xFFFFFFFF, None, 0, total, None):
             raise OSError("WinHTTP send failed (%d)" % ctypes.get_last_error())
@@ -170,7 +169,9 @@ def _http(method, url, headers=None, data=None, timeout=30):
         buf = ctypes.create_string_buffer(65536)
         while True:
             rd = wt.DWORD()
-            if not _wh.WinHttpReadData(req, buf, 65536, ctypes.byref(rd)) or rd.value == 0:
+            if not _wh.WinHttpReadData(req, buf, 65536, ctypes.byref(rd)):
+                raise OSError("WinHTTP read failed (%d)" % ctypes.get_last_error())
+            if rd.value == 0:
                 break
             out.append(buf.raw[:rd.value])
         return code.value, b"".join(out)
@@ -316,11 +317,17 @@ class Hub:
         self.poll_stop = threading.Event()
         self.poll_thread = None
         self.ui_thread = None
-        self.outbox = collections.deque(maxlen=500)
+        self.outbox = collections.deque()          # critical items: never evicted
+        self.outlogs = collections.deque(maxlen=120)
+        self.out_status = None                      # only the latest status matters
         self.printer_online = True
         self.devices = []
         self.login_win = None
-        self.cur_code = 1
+        self.cur_code = None
+        self.status_ts = 0.0
+        self.busy = threading.Lock()
+        self.want_poll = False
+        self.poll_lock = threading.Lock()
         self.cur_gs = "IDLE"
 
     # ---- logging (never log tokens or signed URLs)
@@ -340,6 +347,12 @@ class Hub:
                 page.post_message(obj)
             except Exception as e:  # noqa
                 self.logs.append("post_message failed: %r" % e)
+            return True
+        t = obj.get("type")
+        if t == "status":
+            self.out_status = obj
+        elif t == "log":
+            self.outlogs.append(obj)
         else:
             self.outbox.append(obj)
         return True
@@ -351,11 +364,24 @@ class Hub:
                 items.append(self.outbox.popleft())
             except IndexError:
                 break
+        while self.outlogs:
+            try:
+                items.append(self.outlogs.popleft())
+            except IndexError:
+                break
+        if self.out_status is not None:
+            items.append(self.out_status)
+            self.out_status = None
         if items and self.page is not None:
             try:
                 self.page.post_message({"type": "batch", "items": items})
             except Exception as e:  # noqa
                 self.logs.append("post_message failed: %r" % e)
+
+    def _drop_publish(self, rid):
+        keep = [x for x in list(self.outbox) if not (x.get("type") == "publish" and x.get("id") == rid)]
+        self.outbox.clear()
+        self.outbox.extend(keep)
 
     # ---- events from the JS page (UI thread; keep it quick)
     def on_page_message(self, data):
@@ -369,6 +395,9 @@ class Hub:
             if t == "pull":
                 self._drain()
             elif t == "ready":
+                self.outbox.clear()
+                self.outlogs.clear()
+                self.out_status = None
                 self.page_ready = True
                 self.rtm_online = False
                 self.log("RTM page ready")
@@ -405,7 +434,7 @@ class Hub:
                 self._fail_pending(data.get("id"), err)
             elif t == "cmd":
                 threading.Thread(target=self._ui_cmd, args=(data,), daemon=True, name="cc2-ui-cmd").start()
-            elif t == "token_expiring":
+            elif t == "token_expiring" and not stale:
                 threading.Thread(target=self._renew, daemon=True).start()
             elif t == "msg":
                 self._on_rtm_text(data.get("text", ""))
@@ -421,7 +450,7 @@ class Hub:
             self._post({"type": "info", "name": r.get("hostname") or self.dev_name,
                         "model": r.get("machine_model", ""), "ip": r.get("ip", ""), "sn": self.sn,
                         "fw": _dict(r.get("software_version")).get("ota_version", "")})
-            if not (self.poll_thread and self.poll_thread.is_alive() and not self.poll_stop.is_set()):
+            if self.want_poll and not (self.poll_thread and self.poll_thread.is_alive() and not self.poll_stop.is_set()):
                 self.start_poll()
         except Exception as e:
             self.log("after login: %s" % e)
@@ -429,13 +458,19 @@ class Hub:
     def _safe_login(self):
         try:
             self.login_fail_until = 0.0
+            self.want_poll = True
             self.ensure_login()
             if not (self.poll_thread and self.poll_thread.is_alive() and not self.poll_stop.is_set()):
                 self.start_poll()
         except Exception as e:
             self.log("login: %s" % e)
 
+    def is_idle(self):
+        return self.cur_code == 1 and time.time() - self.status_ts < 20
+
     def _set_printer_online(self, on, msg=None):
+        if not on:
+            self.cur_code = None
         if self.printer_online != on:
             self.printer_online = on
             self._post({"type": "conn", "printer": on, "msg": msg})
@@ -460,8 +495,29 @@ class Hub:
             raise ValueError("%s must be %d-%d" % (name, lo, hi))
         return n
 
+    @staticmethod
+    def _valid_name(n):
+        n = str(n)
+        if not n.lower().endswith(".gcode") or len(n) > 200 or ".." in n or "/" in n or "\\" in n:
+            raise ValueError("bad file name")
+        if any(ord(c) < 32 for c in n):
+            raise ValueError("bad file name")
+        return n
+
     def _exec_ui(self, m, p):
-        idle = self.cur_code == 1
+        long_ops = (1024, 1025, 1026, 2001, 2002, "start_file")
+        mm = int(m) if str(m).isdigit() else m
+        if mm in long_ops:
+            if not self.busy.acquire(blocking=False):
+                raise RuntimeError("another operation is still running")
+            try:
+                return self._exec_ui2(m, p)
+            finally:
+                self.busy.release()
+        return self._exec_ui2(m, p)
+
+    def _exec_ui2(self, m, p):
+        idle = self.is_idle()
         if m == "acct_status":
             if SESSION.logged_in() and not self.devices:
                 try:
@@ -484,6 +540,7 @@ class Hub:
             if sn not in [x["sn"] for x in self.devices]:
                 raise ValueError("unknown printer")
             SESSION.update(sn=sn)
+            self.want_poll = False
             self.stop_poll()
             self.logout()
             self.status, self.sn = {}, sn
@@ -491,6 +548,7 @@ class Hub:
             return self.account_state()
         if m == "acct_connect":
             self.login_fail_until = 0.0
+            self.want_poll = True
             self.ensure_login()
             self.request(1001, {}, timeout=15)
             self.was_connected = True
@@ -516,9 +574,7 @@ class Hub:
         if m == "start_file":
             if not idle:
                 raise RuntimeError("the printer is not idle")
-            name = str(p.get("filename", ""))
-            if not name or "/" in name or "\\" in name:
-                raise ValueError("bad file name")
+            name = self._valid_name(p.get("filename", ""))
             slots = []
             for x in p.get("slots") or []:
                 slots.append({"t": self._int(x.get("t"), 0, 15, "t"), "canvas_id": self._int(x.get("canvas_id"), 0, 3, "canvas"),
@@ -540,7 +596,8 @@ class Hub:
             ax = str(p.get("axes", "")).lower()
             if ax not in ("x", "y", "z") or not idle:
                 raise RuntimeError("moving needs an idle printer and one axis")
-            if ax not in str(self.status.get("tool_head", {}).get("homed_axes", "") or ""):
+            th = _dict(self.status.get("tool_head")) or _dict(self.status.get("toolhead"))
+            if ax not in str(th.get("homed_axes", "") or ""):
                 raise RuntimeError("home the %s axis before moving it" % ax.upper())
             dist = float(p.get("distance", 0))
             if not (0 < abs(dist) <= 100):
@@ -569,9 +626,12 @@ class Hub:
         if m == 2004:
             return self.request(2004, {"auto_refill": bool(p.get("auto_refill"))}, timeout=15)
         if m == 1047:
-            names = [str(x) for x in (p.get("file_path") or [])]
-            if not names or any("/" in x or "\\" in x for x in names):
+            names = [self._valid_name(x) for x in (p.get("file_path") or [])]
+            if not names:
                 raise ValueError("bad file name")
+            cur = str(_dict(self.status.get("print_status")).get("filename", ""))
+            if cur in names and not idle:
+                raise RuntimeError("that file is being printed")
             return self.request(1047, {"storage_media": "local", "file_path": names}, timeout=30)
         raise ValueError("command not allowed: %s" % m)
 
@@ -657,6 +717,7 @@ class Hub:
         self._push_account()
 
     def sign_out(self):
+        self.want_poll = False
         self.stop_poll()
         self.was_connected = False
         self.logout()
@@ -767,6 +828,7 @@ class Hub:
             self.log("token renew failed: %s" % e)
 
     def logout(self):
+        self.cur_code = None
         self.rtm_online = False
         self.gen += 1
         self._post({"type": "logout"})
@@ -779,12 +841,13 @@ class Hub:
             rid = self.seq
             slot = [threading.Event(), None]
             self.pending[rid] = slot
-        self._post({"type": "publish", "id": rid,
+        self._post({"type": "publish", "id": rid, "deadline": time.time() + timeout + 2,
                     "text": json.dumps({"id": rid, "method": method, "params": params or {}})})
         ok = slot[0].wait(timeout)
         with self.lock:
             self.pending.pop(rid, None)
         if not ok:
+            self._drop_publish(rid)
             raise RuntimeError("printer did not answer method %s" % method)
         res = _dict((slot[1] or {}).get("result"))
         ec = res.get("error_code", 0)
@@ -818,10 +881,11 @@ class Hub:
         ex, hb = _dict(s.get("extruder")), _dict(s.get("heater_bed"))
         zt, gm = _dict(s.get("ztemperature_sensor")), _dict(s.get("gcode_move"))
         fans, th = _dict(s.get("fans")), _dict(s.get("tool_head")) or _dict(s.get("toolhead"))
+        has_code = ms.get("status") is not None
         code, sub = int(_num(ms.get("status"), 1)), int(_num(ms.get("sub_status"), 0))
         pstate = str(ps.get("state", "")).lower()
         if code == 2:
-            if sub in (2501, 2502, 2505):
+            if sub in (2502, 2505):
                 gs = "PAUSE"
             elif sub == 2077:
                 gs = "FINISH"
@@ -832,10 +896,14 @@ class Hub:
         elif code == 1:
             gs = "FINISH" if pstate in ("complete", "completed", "finished") else (
                 "FAILED" if pstate in ("cancelled", "canceled", "stopped", "failed", "error") else "IDLE")
+        elif code == 14:
+            gs = "FAILED"
         else:
-            gs = "IDLE"
+            gs = "PREPARE"
         label = self.SUB2.get(sub) if code == 2 and sub in self.SUB2 else self.LABELS.get(code, "Status %s" % code)
-        self.cur_code, self.cur_gs = code, gs
+        if has_code:
+            self.cur_code, self.status_ts = code, time.time()
+        self.cur_gs = gs
         sw = _dict(self.attrs.get("software_version")).get("ota_version", "")
         pct = int(_num(ps.get("progress", ms.get("progress", 0))))
         msg = {"print": {
@@ -882,6 +950,7 @@ class Hub:
 
     # ---- polling (one thread, own stop event)
     def start_poll(self):
+      with self.poll_lock:
         self.stop_poll()
         ev = threading.Event()
         self.poll_stop = ev
@@ -1056,7 +1125,7 @@ class CC2Agent(pa.PrinterAgentBase):
 
     def get_agent_info(self):
         i = pa.AgentInfo()
-        i.id, i.name, i.version = AGENT_ID, "Elegoo CC2 (cloud)", "0.1.0"
+        i.id, i.name, i.version = AGENT_ID, "Elegoo CC2 (cloud)", "0.2.0"
         i.description = "Elegoo Centauri Carbon 2 via the Elegoo cloud"
         return i
 
@@ -1123,6 +1192,7 @@ class CC2Agent(pa.PrinterAgentBase):
                 HUB.ensure_login()
                 HUB.request(1001, {}, timeout=15)
                 HUB.was_connected = True
+                HUB.want_poll = True
                 HUB._fire_local_connect(0, "")
                 HUB.start_poll()
             except Exception as e:
@@ -1132,6 +1202,7 @@ class CC2Agent(pa.PrinterAgentBase):
         return 0
 
     def disconnect_printer(self):
+        HUB.want_poll = False
         HUB.stop_poll()
         HUB.was_connected = False
         HUB.logout()
@@ -1163,7 +1234,7 @@ class CC2Agent(pa.PrinterAgentBase):
     def _rc(self, method, params=None):
         def run():
             try:
-                HUB.request(method, params or {}, timeout=20)
+                HUB._exec_ui(method, params or {})
             except Exception as e:
                 HUB.log("cmd %s: %s" % (method, e))
         threading.Thread(target=run, daemon=True).start()
@@ -1183,7 +1254,7 @@ class CC2Agent(pa.PrinterAgentBase):
         if temps:
             handled = True
             self._rc(1028, temps)
-        if "G28" in g:
+        if any(re.match(r"G28\b", ln.split(";")[0].strip()) for ln in g.splitlines()):
             handled = True
             self._rc(1026, {"homed_axes": "xyz"})
         return 0 if handled else -7010
@@ -1480,18 +1551,22 @@ function setChip(id,text,cls){ const e=$(id); e.textContent=text; e.className='c
 let noteT=null;
 function note(text,kind){ const n=$('note'); n.textContent=text; n.className=kind||''; n.style.display='block'; clearTimeout(noteT); noteT=setTimeout(()=>{n.style.display='none';},kind==='bad'?9000:3500); }
 let RID=0; const WAIT={};
+async function locked(fn){ BUSY=true; applyStatus(S); try{ return await fn(); } finally{ BUSY=false; applyStatus(S); } }
 function call(method,params,ms){ return new Promise((res,rej)=>{ const rid=++RID; const t=setTimeout(()=>{delete WAIT[rid];rej(new Error('timeout'));},ms||45000); WAIT[rid]={res,rej,t}; P({type:'cmd',rid,method,params:params||{}}); }); }
 async function run(label,method,params,ms){ try{ const r=await call(method,params,ms); if(label) note(label,'ok'); return r; }catch(e){ note((label||String(method))+' failed: '+e.message,'bad'); throw e; } }
 const fmtT=m=>{ if(!m) return '-'; const h=Math.floor(m/60), mm=Math.round(m%60); return h?h+' h '+mm+' min':mm+' min'; };
 const fmtS=s=>{ if(!s) return '-'; const m=Math.round(s/60); return fmtT(m); };
 const fmtMB=b=>b?(b/1048576).toFixed(b<1048576*10?2:1)+' MB':'-';
-const fmtD=t=>{ if(!t) return '-'; const d=new Date((t>1e12?t:t*1000)); return d.toISOString().slice(0,16).replace('T',' '); };
-const esc=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const fmtD=t=>{ if(!t) return '-'; const d=new Date((t>1e12?t:t*1000)); return isNaN(d)?'-':d.toISOString().slice(0,16).replace('T',' '); };
+const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const col=s=>/^#?[0-9a-f]{3,8}$/i.test(String(s||''))?(String(s)[0]==='#'?String(s):'#'+s):'#ddd';
+const num=v=>(+v)|0;
 
 /* ---------- live state ---------- */
-let S={code:1,state:'IDLE',homed:'',online:false}; let STEP=10, dragging=null;
+let S={code:null,state:'IDLE',homed:'',online:false}; let STEP=10, dragging=null, BUSY=false;
+const active=m=>m.code===2&&m.sub!==2077&&m.sub!==2504;
 function applyStatus(m){
-  S=m; const idle=(m.code===1), printing=(m.code===2), paused=(m.state==='PAUSE');
+  S=m; const idle=(m.code===1)&&!BUSY, printing=active(m), paused=(m.state==='PAUSE');
   $('cSt').textContent=m.label||m.state; $('cSt').className='chip '+(printing?'ok':(m.code===14?'bad':''));
   $('pFile').textContent=m.file||''; $('pBar').style.width=Math.min(100,m.progress||0)+'%';
   $('vPg').textContent=(m.progress||0)+'%'; $('vLy').textContent=m.total?(m.layer+' / '+m.total):'-'; $('vLf').textContent=fmtT(m.left);
@@ -1504,7 +1579,8 @@ function applyStatus(m){
   const canPause=printing&&!paused, canResume=paused;
   $('bPause').disabled=!canPause; $('bResume').disabled=!canResume; $('bStop').disabled=!(printing||paused);
   document.querySelectorAll('[data-mv],#bHxy,#bHz,#bHall').forEach(b=>b.disabled=!idle);
-  $('bNz').disabled=$('bNz0').disabled=$('bBd').disabled=$('bBd0').disabled=!(idle||printing||m.code===13);
+  $('bNz').disabled=$('bBd').disabled=!(m.code===1||printing||m.code===13);
+  $('bNz0').disabled=$('bBd0').disabled=!(m.code===1||m.code===13);
   $('bLoad').disabled=$('bUnload').disabled=$('bFeed').disabled=$('bRetreat').disabled=!idle;
 }
 
@@ -1515,6 +1591,7 @@ async function handle(m){
   else if(m.type==='logout'){ GEN++; await drop(); setChip('cRtm','RTM: logged out',''); }
   else if(m.type==='renew' && rtm){ try{ await rtm.renewToken(m.token);}catch(e){ L('renew '+e);} }
   else if(m.type==='publish'){
+    if(m.deadline && Date.now()/1000>m.deadline){ L('dropped an expired command'); return; }
     if(!rtm||!C){ P({type:'publish_err',id:m.id,error:'RTM not logged in'}); return; }
     try{ await rtm.publish(C.userId+C.sn,m.text,{channelType:'USER',customType:'PlainText'}); }
     catch(e){ P({type:'publish_err',id:m.id,error:(e&&e.message)||JSON.stringify(e)}); }
@@ -1560,9 +1637,9 @@ $('bBd').onclick=()=>{ const v=parseInt($('iBd').value); if(!(v>=0&&v<=120)) ret
 $('bNz0').onclick=()=>setT('extruder','iNz',0); $('bBd0').onclick=()=>setT('heater_bed','iBd',0);
 document.querySelectorAll('#steps button').forEach(b=>b.onclick=()=>{ STEP=+b.dataset.s; document.querySelectorAll('#steps button').forEach(x=>x.classList.toggle('sel',x===b)); });
 document.querySelectorAll('[data-mv]').forEach(b=>b.onclick=()=>{ const [ax,sg]=[b.dataset.mv[0],b.dataset.mv[1]]; run(null,1027,{axes:ax,distance:(sg==='-'?-1:1)*STEP}).catch(()=>{}); });
-$('bHxy').onclick=()=>run('Homing XY',1026,{homed_axes:'xy'},60000).catch(()=>{});
-$('bHz').onclick=()=>run('Homing Z',1026,{homed_axes:'z'},60000).catch(()=>{});
-$('bHall').onclick=()=>run('Homing all axes',1026,{homed_axes:'xyz'},90000).catch(()=>{});
+$('bHxy').onclick=()=>locked(()=>run('Homing XY',1026,{homed_axes:'xy'},150000)).catch(()=>{});
+$('bHz').onclick=()=>locked(()=>run('Homing Z',1026,{homed_axes:'z'},150000)).catch(()=>{});
+$('bHall').onclick=()=>locked(()=>run('Homing all axes',1026,{homed_axes:'xyz'},180000)).catch(()=>{});
 for(const [id,key,lab] of [['fModel','fan','vModel'],['fAux','aux_fan','vAux'],['fCase','box_fan','vCase']]){
   const el=$(id);
   el.oninput=()=>{ dragging=id; $(lab).textContent=el.value+'%'; };
@@ -1578,7 +1655,7 @@ function renderCanvas(){
   if(!list.length){ box.innerHTML='<span class="mut">No Canvas connected.</span>'; return; }
   for(const c of list){ for(const t of (c.tray_list||[])){
     const d=document.createElement('div'); const has=t.filament_type||t.filament_name; d.className='slot'+(has?'':' empty')+((SEL&&SEL.c===c.canvas_id&&SEL.t===t.tray_id)?' on':'');
-    d.innerHTML='<div class="dot" style="background:'+esc(t.filament_color||'#ddd')+'"></div><b>'+esc(t.filament_type||'-')+'</b><small>'+(list.length>1?'C'+c.canvas_id+' ':'')+'slot '+(t.tray_id+1)+'</small>';
+    d.innerHTML='<div class="dot" style="background:'+col(t.filament_color)+'"></div><b>'+esc(t.filament_type||'-')+'</b><small>'+(list.length>1?'C'+num(c.canvas_id)+' ':'')+'slot '+(num(t.tray_id)+1)+'</small>';
     d.onclick=()=>{ SEL={c:c.canvas_id,t:t.tray_id}; renderCanvas(); };
     box.appendChild(d);
   } }
@@ -1586,10 +1663,10 @@ function renderCanvas(){
 }
 async function loadCanvas(){ try{ const r=await call('canvas'); CANVAS=r.canvas_info||null; renderCanvas(); }catch(e){ note('Canvas: '+e.message,'bad'); } }
 $('bCanvas').onclick=loadCanvas;
-$('bLoad').onclick=()=>{ if(!SEL) return note('Select a slot first','bad'); run('Loading filament',2001,{canvas_id:SEL.c,tray_id:SEL.t},300000).then(loadCanvas).catch(()=>{}); };
-$('bUnload').onclick=()=>{ if(!SEL) return note('Select a slot first','bad'); run('Unloading filament',2002,{canvas_id:SEL.c,tray_id:SEL.t},300000).then(loadCanvas).catch(()=>{}); };
-$('bFeed').onclick=()=>run('Feeding',1024,{},300000).catch(()=>{});
-$('bRetreat').onclick=()=>run('Retracting',1025,{},300000).catch(()=>{});
+$('bLoad').onclick=()=>{ if(!SEL) return note('Select a slot first','bad'); locked(()=>run('Loading filament',2001,{canvas_id:SEL.c,tray_id:SEL.t},330000)).then(loadCanvas).catch(()=>{}); };
+$('bUnload').onclick=()=>{ if(!SEL) return note('Select a slot first','bad'); locked(()=>run('Unloading filament',2002,{canvas_id:SEL.c,tray_id:SEL.t},330000)).then(loadCanvas).catch(()=>{}); };
+$('bFeed').onclick=()=>locked(()=>run('Feeding',1024,{},330000)).catch(()=>{});
+$('bRetreat').onclick=()=>locked(()=>run('Retracting',1025,{},330000)).catch(()=>{});
 $('autoRefill').onchange=e=>run('Auto refill '+(e.target.checked?'on':'off'),2004,{auto_refill:e.target.checked}).catch(()=>{});
 
 /* ---------- files and history ---------- */
@@ -1600,13 +1677,13 @@ $('bFiles').onclick=()=>refresh();
 async function refresh(){ $('startPanel').style.display='none'; if(TAB==='files') return loadFiles(); return loadHistory(); }
 async function loadFiles(){
   $('fileBox').innerHTML='<span class="mut">Loading...</span>';
-  try{ const r=await call('files'); FILES=r.files||[]; renderFiles(); }catch(e){ $('fileBox').innerHTML='<span class="mut">Could not load files: '+esc(e.message)+'</span>'; }
+  try{ const r=await call('files',{},180000); FILES=r.files||[]; renderFiles(); }catch(e){ $('fileBox').innerHTML='<span class="mut">Could not load files: '+esc(e.message)+'</span>'; }
 }
 function renderFiles(){
   if(!FILES.length){ $('fileBox').innerHTML='<span class="mut">No files on the printer.</span>'; return; }
   const rows=FILES.slice().sort((a,b)=>(b.create_time||0)-(a.create_time||0)).map((f,i)=>{
-    const dots=(f.color_map||[]).map(c=>'<i style="background:'+esc(c.color)+'" title="T'+esc(c.t)+' '+esc(c.name)+'"></i>').join('');
-    return '<tr><td class="n" title="'+esc(f.filename)+'">'+esc(f.filename)+'</td><td>'+fmtMB(f.size)+'</td><td>'+(f.layer||'-')+'</td><td>'+fmtS(f.print_time)+'</td><td>'+(f.total_filament_used?f.total_filament_used.toFixed(1)+' g':'-')+'</td><td class="dots">'+dots+'</td><td>'+fmtD(f.create_time)+'</td>'+
+    const dots=(f.color_map||[]).map(c=>'<i style="background:'+col(c.color)+'" title="T'+esc(c.t)+' '+esc(c.name)+'"></i>').join('');
+    return '<tr><td class="n" title="'+esc(f.filename)+'">'+esc(f.filename)+'</td><td>'+fmtMB(f.size)+'</td><td>'+esc(f.layer||'-')+'</td><td>'+fmtS(f.print_time)+'</td><td>'+(Number(f.total_filament_used)?Number(f.total_filament_used).toFixed(1)+' g':'-')+'</td><td class="dots">'+dots+'</td><td>'+fmtD(f.create_time)+'</td>'+
       '<td style="white-space:nowrap"><button class="pri" data-p="'+i+'">Print</button> <button class="dng" data-d="'+i+'">Delete</button></td></tr>';
   }).join('');
   $('fileBox').innerHTML='<table><tr><th>File</th><th>Size</th><th>Layers</th><th>Time</th><th>Filament</th><th>Colours</th><th>Created</th><th></th></tr>'+rows+'</table>';
@@ -1615,15 +1692,17 @@ function renderFiles(){
   $('fileBox').querySelectorAll('[data-d]').forEach(b=>b.onclick=()=>askDelete(sorted[+b.dataset.d]));
 }
 function askDelete(f){
-  const p=$('startPanel'); p.style.display='block';
+  PANEL++; const p=$('startPanel'); p.style.display='block';
   p.innerHTML='Delete <b>'+esc(f.filename)+'</b> from the printer? <button class="dng" id="yDel">Yes, delete</button> <button id="nDel">No</button>';
   $('nDel').onclick=()=>{p.style.display='none';};
   $('yDel').onclick=async()=>{ p.style.display='none'; try{ await run('Deleted',1047,{storage_media:'local',file_path:[f.filename]}); loadFiles(); }catch(e){} };
 }
+let PANEL=0;
 async function openStart(f){
-  const p=$('startPanel'); p.style.display='block'; p.innerHTML='Reading filament slots...';
-  if(!CANVAS){ await loadCanvas(); }
+  const my=++PANEL; const p=$('startPanel'); p.style.display='block'; p.innerHTML='Reading filament slots...';
+  await loadCanvas(); if(my!==PANEL) return;
   const trays=[]; for(const c of ((CANVAS&&CANVAS.canvas_list)||[])){ if(!c.connected) continue; for(const t of (c.tray_list||[])) trays.push({c:c.canvas_id,t:t.tray_id,type:t.filament_type||'',color:t.filament_color||'',name:t.filament_name||''}); }
+  if(!trays.length){ p.style.display='none'; return note('No filament slot available (is the Canvas connected?)','bad'); }
   const tools=(f.color_map&&f.color_map.length)?f.color_map:[{t:0,color:'',name:''}];
   let html='<b>Print '+esc(f.filename)+'</b><div class="mut">Choose the slot for each filament in the file.</div>';
   const used=new Set();
@@ -1631,15 +1710,15 @@ async function openStart(f){
     let guess=trays.findIndex((x,j)=>!used.has(j)&&x.type&&tl.name&&x.type.toUpperCase()===String(tl.name).toUpperCase());
     if(guess<0) guess=trays.findIndex((x,j)=>!used.has(j));
     if(guess>=0) used.add(guess);
-    html+='<div class="row"><span style="min-width:150px">T'+esc(tl.t)+' '+esc(tl.name||'')+' '+(tl.color?'<i style="display:inline-block;width:12px;height:12px;border-radius:50%;background:'+esc(tl.color)+';border:1px solid #0003"></i>':'')+'</span><select data-t="'+esc(tl.t)+'">'+
-      trays.map((x,j)=>'<option value="'+j+'"'+(j===(guess>=0?guess:Math.min(i,trays.length-1))?' selected':'')+'>'+(trays.length>0&&CANVAS.canvas_list.filter(c=>c.connected).length>1?'C'+x.c+' ':'')+'slot '+(x.t+1)+' - '+esc(x.type||'empty')+'</option>').join('')+'</select></div>';
+    html+='<div class="row"><span style="min-width:150px">T'+esc(tl.t)+' '+esc(tl.name||'')+' '+(tl.color?'<i style="display:inline-block;width:12px;height:12px;border-radius:50%;background:'+col(tl.color)+';border:1px solid #0003"></i>':'')+'</span><select data-t="'+esc(tl.t)+'">'+
+      trays.map((x,j)=>'<option value="'+j+'"'+(j===(guess>=0?guess:Math.min(i,trays.length-1))?' selected':'')+'>'+(trays.length>0&&CANVAS.canvas_list.filter(c=>c.connected).length>1?'C'+num(x.c)+' ':'')+'slot '+(num(x.t)+1)+' - '+esc(x.type||'empty')+'</option>').join('')+'</select></div>';
   });
   html+='<div class="row"><label class="sw"><input type="checkbox" id="chkLevel"> Auto bed leveling</label></div><div class="row"><button class="pri" id="yPrint">Start print</button> <button id="nPrint">Cancel</button></div>';
   p.innerHTML=html; $('nPrint').onclick=()=>{p.style.display='none';};
   $('yPrint').onclick=async()=>{
     const slots=[...p.querySelectorAll('select[data-t]')].map(s=>({t:+s.dataset.t,canvas_id:trays[+s.value].c,tray_id:trays[+s.value].t}));
     if(!slots.length||slots.some(s=>s.canvas_id===undefined)) return note('No filament slot available','bad');
-    p.style.display='none'; try{ await run('Print started','start_file',{filename:f.filename,slots,leveling:$('chkLevel')?$('chkLevel').checked:false}); }catch(e){}
+    p.style.display='none'; try{ await locked(()=>run('Print started','start_file',{filename:f.filename,slots,leveling:$('chkLevel')?$('chkLevel').checked:false},60000)); }catch(e){}
   };
 }
 async function loadHistory(){
