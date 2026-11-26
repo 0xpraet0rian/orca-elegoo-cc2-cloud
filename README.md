@@ -27,7 +27,8 @@
 | **Print control** | Start, pause and stop; set nozzle and bed temperature; home axes |
 | **Live status** | Progress, layers, temperatures and remaining time shown in Orca |
 | **Multi-colour** | Filament slots are taken from Orca's mapping and sent as the printer's `slot_map` |
-| **No new login** | Reuses the ElegooSlicer account session that is already on the PC |
+| **Own sign-in** | Signs in to your Elegoo account with Elegoo's own page, in your browser, through a local pass-through; the session is stored encrypted (Windows DPAPI) |
+| **Control tab** | Print, temperature, motion, fans, light, Canvas filament, files, history and camera in one tab |
 | **No dependencies** | One Python file; the standard library only |
 
 ## Status
@@ -59,8 +60,11 @@ This is an early, personal-use build. What has been checked against a real print
 6. Use *Send* from the Prepare tab.
 
 > Orca requires the file name to end with the OS and architecture (`_win_x86_64`).
-> The plugin reads the ElegooSlicer login from `%APPDATA%\ElegooSlicer\user\user_info` (Windows DPAPI),
-> so it is Windows-only and needs you to be signed in to ElegooSlicer at least once.
+> Sign in from the **Elegoo CC2** tab. The sign-in page opens in your browser and is served through a loopback
+> server on 127.0.0.1 started by the plugin, so your password passes through the plugin's memory on its way to
+> Elegoo; it is never stored or logged, and only the session Elegoo returns is kept (encrypted with Windows DPAPI).
+> The plugin is Windows-only. A separate *Use ElegooSlicer session* button can import the token of an installed
+> ElegooSlicer instead.
 
 ## How it works
 
