@@ -2298,6 +2298,15 @@ PAGE_HTML = r"""<!doctype html><meta charset="utf-8">
  .pager{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-top:14px}
  #app button.pg{min-width:32px;padding:3px 9px}
 
+ .help{padding:0}
+ .help>summary{cursor:pointer;padding:12px 18px;font:650 13px var(--sans);list-style:none;color:var(--text);display:flex;align-items:center;gap:10px}
+ .help>summary::-webkit-details-marker{display:none}
+ .help>summary::before{content:"";width:0;height:0;border-left:6px solid var(--acc);border-top:5px solid transparent;border-bottom:5px solid transparent;transition:transform .15s}
+ .help[open]>summary::before{transform:rotate(90deg)}
+ .helpbody{padding:0 18px 14px;display:block}
+ .helpbody ol{margin:4px 0 10px;padding-left:22px}
+ .helpbody li{margin:6px 0;line-height:1.5}
+ .helpbody code{font-family:var(--mono);background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:0 5px}
  /* Orca injects <style id="orca-plugin-defaults"> after this one (html/body colours, headings, button, input/select,
     th/td). Equal-specificity rules would lose to it, so the base elements are restated with higher specificity. */
  :root,:root body{background:var(--bg) var(--bgimg) fixed;color:var(--text);font-family:var(--sans);font-size:13px}
@@ -2352,6 +2361,25 @@ PAGE_HTML = r"""<!doctype html><meta charset="utf-8">
     <div class="mut">Close ElegooSlicer while connected: the Elegoo account allows one cloud session. LAN mode is not supported yet.</div>
   </div>
 </div>
+
+<details class="card help" id="help" style="margin-bottom:12px">
+  <summary>How to print from Orca</summary>
+  <div class="helpbody">
+    <ol>
+      <li><b>Sign in</b> above and wait for <i>cloud link: online</i>. Keep this tab open while you print: it holds the connection to the printer.</li>
+      <li><b>One-time setup in Orca.</b> In the Printer panel add a <i>physical printer</i> (icon next to the printer name):
+        Host Type <b>Elegoo Link</b>, Hostname <code>127.0.0.1:47890</code>, API key empty. Press <i>Test</i>; it should succeed. Select that printer.</li>
+      <li><b>Slice</b> your plate, then press Orca's <b>Print</b> button.</li>
+      <li>The file goes to the Elegoo cloud and the printer downloads it. Orca stays at about 99% for one to two minutes while this happens; that is normal.</li>
+      <li>When the download is done the plugin <b>starts the print by itself</b> and matches each colour to a filament slot by type (PLA to a PLA slot). Progress is in <i>Command console</i>.
+        Turn this off with <i>Start after Orca upload</i> in the Files bar; then press <i>Print</i> on the file in <i>Printer files</i> to choose slots yourself.</li>
+    </ol>
+    <div class="mut"><b>Other ways in:</b> <i>Send G-code...</i> (Files bar) uploads a <code>.gcode</code> or <code>.gcode.3mf</code> you pick, without Orca's Print button.
+      Files already on the printer start from <i>Printer files</i>.</div>
+    <div class="mut" style="margin-top:6px"><b>If it fails:</b> check <i>Command console</i> for the failing step. &quot;Another session&quot; means ElegooSlicer or an old tab is still connected;
+      &quot;offline in the cloud&quot; means the printer is off or has no Wi-Fi. Close ElegooSlicer while this plugin is connected.</div>
+  </div>
+</details>
 
 <div id="ctlHint" class="mut" style="margin:4px 2px 10px">Connect to the Elegoo cloud (Account above) to see and control the printer.</div>
 <div class="cols off" id="ctl">

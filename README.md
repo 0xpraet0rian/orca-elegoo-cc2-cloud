@@ -25,6 +25,7 @@
 | | |
 |---|---|
 | **Print from Orca** | Slice and press Orca's normal *Print* button. A small local bridge answers as an Elegoo Link printer, the plugin uploads the file to the Elegoo cloud, the printer downloads it and the print **starts by itself** (filament slots matched by filament type; switch off with *Start after Orca upload*) |
+| **Built-in guide** | A collapsible *How to print from Orca* card at the top of the tab explains the one-time setup, the upload and the automatic start |
 | **Send G-code** | A button in the tab: pick a `.gcode` or `.gcode.3mf` with the Windows file dialog and upload it to the printer, then start it from *Printer files* |
 | **Control tab** | Print (pause, resume, stop, speed), temperatures, motion with homing, fans, light, Canvas filament load and unload, files, print history |
 | **Camera** | Live view from the printer. It starts by itself when the printer connects (switch off with *Auto-start*), and the picture can be resized or shown full screen |
