@@ -6,7 +6,7 @@
 # name = "Elegoo CC2 Cloud"
 # description = "Send gcode to and control an Elegoo Centauri Carbon 2 from OrcaSlicer through the Elegoo cloud: upload, start/pause/stop, live status. Reuses your ElegooSlicer login (close ElegooSlicer while connected)."
 # author = "personal use"
-# version = "0.4.0"
+# version = "0.5.0"
 # ///
 """
 Elegoo Centauri Carbon 2 - cloud printer agent for OrcaSlicer 2.5.x
@@ -1949,7 +1949,7 @@ class CC2Agent(pa.PrinterAgentBase):
 
     def get_agent_info(self):
         i = pa.AgentInfo()
-        i.id, i.name, i.version = AGENT_ID, "Elegoo CC2 (cloud)", "0.4.0"
+        i.id, i.name, i.version = AGENT_ID, "Elegoo CC2 (cloud)", "0.5.0"
         i.description = "Elegoo Centauri Carbon 2 via the Elegoo cloud"
         return i
 

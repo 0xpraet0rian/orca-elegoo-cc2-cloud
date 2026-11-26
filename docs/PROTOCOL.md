@@ -144,6 +144,20 @@ The camera uses Agora RTC (not RTM), as in ElegooSlicer's Device page. V
 - Topics documented by the community: `elegoo/<sn>/api_register`, `elegoo/<sn>/<client>/api_request`,
   `elegoo/<sn>/<client>/api_response`, `elegoo/<sn>/api_status`.
 
+## 5b. Orca's Elegoo Link host for the CC2 (emulated by the plugin)
+
+Read from `ElegooLink.cpp` in OrcaSlicer; the plugin answers these on `127.0.0.1:47890`:
+
+- `GET /system/info?X-Token=<token>` (token = API key, default `123456`) expects
+  `{"error_code":0,"system_info":{"sn":"<serial>"}}`.
+- `PUT /upload`, body = raw chunk of at most 1 MiB, headers `Content-Range: bytes a-b/total`, `X-File-Name`,
+  `X-File-MD5` (whole file), `X-Token`. Each reply must be JSON with `error_code` 0.
+- No start command follows for the CC2 (the post-upload action is none), so the plugin starts the print itself
+  with method `1020` once the printer reports idle, building `slot_map` from `; filament_type` in the G-code and the
+  trays of `2005`.
+- Orca also sends Bambu-style `{"pushing":{"command":"pushall"}}` to the agent every 5 s; the agent must return 0 or
+  Orca shows "This control is not supported on this printer".
+
 ## 6. OrcaSlicer plugin facts used
 
 - The file name must end with the platform, for example `_win_x86_64.py`; metadata is a PEP 723 block.
