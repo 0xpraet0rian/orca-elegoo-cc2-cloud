@@ -597,6 +597,7 @@ class Hub:
         self.printer_online = True
         self.devices = []
         self.login_proxy = None
+        self.connect_lock = threading.Lock()
         self.rtc = None
         self.cur_code = None
         self.status_ts = 0.0
@@ -678,6 +679,7 @@ class Hub:
                 self.log("RTM page ready")
                 self._post({"type": "logs", "lines": list(self.logs)[-100:]})
                 self._push_account()
+                threading.Thread(target=self._auto_connect, daemon=True, name="cc2-autoconnect").start()
             elif t == "login_ok" and not stale:
                 self.rtm_online = True
                 self.login_error = ""
@@ -826,12 +828,10 @@ class Hub:
             self._push_account()
             return self.account_state()
         if m == "acct_connect":
-            self.login_fail_until = 0.0
-            self.want_poll = True
-            self.ensure_login()
-            self.request(1001, {}, timeout=15)
-            self.was_connected = True
-            self._after_login()
+            self.connect_cloud()
+            return self.account_state()
+        if m == "acct_auto":
+            SESSION.update(auto=bool(p.get("on")))
             return self.account_state()
         if m == "files":
             files, page = [], 1
@@ -919,7 +919,7 @@ class Hub:
         d = SESSION.get()
         return {"logged": bool(d.get("token")), "email": d.get("email", ""), "nickname": d.get("nickname", ""),
                 "source": d.get("source", ""), "sn": d.get("sn", "") or self.sn, "devices": self.devices,
-                "rtm": self.rtm_online, "printer": self.printer_online}
+                "rtm": self.rtm_online, "printer": self.printer_online, "auto": d.get("auto", True)}
 
     def _push_account(self):
         self._post(dict(self.account_state(), type="account"))
@@ -982,6 +982,7 @@ class Hub:
                 self.log("device list: %s" % e)
             self._push_account()
             self._post({"type": "note", "kind": "ok", "text": "Signed in."})
+            self._auto_connect()
         except Exception as e:
             self.log("store login: %s" % e)
 
@@ -1014,6 +1015,38 @@ class Hub:
         SESSION.clear()
         self.devices, self.creds, self.sn, self.status = [], None, "", {}
         self._push_account()
+
+    # ---- connect to the cloud (tab button, auto-connect after sign-in / tab open)
+    def _connstat(self, text, kind=""):
+        self.log(text)
+        self._post({"type": "connstat", "text": text, "kind": kind})
+
+    def connect_cloud(self):
+        if not self.connect_lock.acquire(blocking=False):
+            return
+        try:
+            self.login_fail_until = 0.0
+            self.want_poll = True
+            self._connstat("Connecting to the Elegoo cloud...")
+            self.ensure_login()
+            self._connstat("Cloud link is up; asking the printer...")
+            self.request(1001, {}, timeout=15)
+            self.was_connected = True
+            self._after_login()
+            self._connstat("Connected", "ok")
+            self._push_account()
+        except Exception as e:
+            self._connstat("Not connected: %s" % e, "bad")
+            raise
+        finally:
+            self.connect_lock.release()
+
+    def _auto_connect(self):
+        try:
+            if SESSION.logged_in() and SESSION.get().get("auto", True) and not self.rtm_online:
+                self.connect_cloud()
+        except Exception:
+            pass
 
     def _fail_pending(self, rid, err):
         with self.lock:
@@ -1695,6 +1728,7 @@ PAGE_HTML = r"""<!doctype html><meta charset="utf-8">
  .toolbar{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;flex-wrap:wrap;gap:8px}
  #note{position:sticky;top:0;z-index:5;margin:0 0 10px;padding:8px 12px;border-radius:8px;display:none;border:1px solid var(--bd);background:#fff}
  #note.bad{border-color:var(--bad);color:var(--bad)} #note.ok{border-color:var(--ok);color:var(--ok)}
+ .cols.off{opacity:.4;pointer-events:none;filter:grayscale(.4)}
  .panel{border:1px dashed var(--acc);border-radius:8px;padding:10px;margin:8px 0;background:#f1faf9}
  .sw{display:inline-flex;align-items:center;gap:6px} details pre{background:#0001;padding:8px;max-height:220px;overflow:auto;white-space:pre-wrap;border-radius:6px}
  .rng{display:grid;grid-template-columns:90px 1fr 44px;gap:8px;align-items:center;margin:6px 0}
@@ -1718,11 +1752,13 @@ PAGE_HTML = r"""<!doctype html><meta charset="utf-8">
     <div class="row"><span>Signed in as <b id="aMail"></b></span><span class="mut" id="aSrc"></span><span class="chip" id="aLink">cloud link: offline</span></div>
     <div class="row"><span>Printer</span><select id="aDev"></select>
       <button class="pri" id="bConn">Connect via cloud</button><button id="bOut" class="dng">Log out</button></div>
+    <div class="row"><label class="sw"><input type="checkbox" id="aAuto"> Connect automatically</label><span id="aStat" class="mut"></span></div>
     <div class="mut">Close ElegooSlicer while connected: the Elegoo account allows one cloud session. LAN mode is not supported yet.</div>
   </div>
 </div>
 
-<div class="cols">
+<div id="ctlHint" class="mut" style="margin:4px 2px 10px">Connect to the Elegoo cloud (Account above) to see and control the printer.</div>
+<div class="cols off" id="ctl">
   <div class="card" id="cPrint">
     <h3>Print <span class="mut" id="pFile"></span></h3>
     <div class="bar"><i id="pBar"></i></div>
@@ -1892,9 +1928,10 @@ async function handle(m){
   else if(m.type==='logs') (m.lines||[]).forEach(L);
   else if(m.type==='info'){ $('pname').textContent=m.name||'Elegoo CC2'; $('pinfo').textContent=[m.model,'firmware '+(m.fw||'?'),'LAN IP '+(m.ip||'?'),'SN '+(m.sn||'?')].join('  |  '); }
   else if(m.type==='note'){ note(m.text,m.kind); }
+  else if(m.type==='connstat'){ const e=$('aStat'); e.textContent=m.text; e.style.color=m.kind==='bad'?'var(--bad)':(m.kind==='ok'?'var(--ok)':''); }
   else if(m.type==='account'){ renderAccount(m); }
-  else if(m.type==='conn'){ setChip('cPr','Printer: '+(m.printer?'online':'offline'),m.printer?'ok':'bad'); if(m.msg) note(m.msg,m.printer?'ok':'bad'); }
-  else if(m.type==='status'){ setChip('cPr','Printer: online','ok'); applyStatus(m); }
+  else if(m.type==='conn'){ setChip('cPr','Printer: '+(m.printer?'online':'offline'),m.printer?'ok':'bad'); if(m.msg) note(m.msg,m.printer?'ok':'bad'); if(!m.printer){ $('ctl').classList.add('off'); $('ctlHint').style.display='block'; $('aStat').textContent=m.msg||'Printer is offline in the Elegoo cloud'; $('aStat').style.color='var(--bad)'; } }
+  else if(m.type==='status'){ setChip('cPr','Printer: online','ok'); $('ctl').classList.remove('off'); $('ctlHint').style.display='none'; applyStatus(m); }
   else if(m.type==='cmd_result'){ const w=WAIT[m.rid]; if(!w) return; clearTimeout(w.t); delete WAIT[m.rid]; m.ok?w.res(m.result):w.rej(new Error(m.error)); }
   else if(m.type==='batch'){ for(const it of (m.items||[])) await handle(it); }
 }
@@ -1910,13 +1947,15 @@ function renderAccount(a){
   $('aMail').textContent=a.email||a.nickname||'(account)'; $('aSrc').textContent=a.source==='imported'?'(session imported from ElegooSlicer)':'';
   const sel=$('aDev'); sel.innerHTML=(a.devices||[]).map(d=>'<option value="'+esc(d.sn)+'"'+(d.sn===a.sn?' selected':'')+'>'+esc(d.name)+' ('+esc(d.sn)+')</option>').join('');
   const on=a.rtm; $('aLink').textContent='cloud link: '+(on?'online':'offline'); $('aLink').className='chip '+(on?'ok':'');
+  $('aAuto').checked=a.auto!==false; if(!on){ $('ctl').classList.add('off'); $('ctlHint').style.display='block'; }
 }
 async function loadAccount(){ try{ renderAccount(await call('acct_status')); }catch(e){ note('Account: '+e.message,'bad'); } }
 $('bSign').onclick=()=>run('Sign-in page opened in your browser','acct_login').catch(()=>{});
 $('bImport').onclick=()=>run('Session imported','acct_import').then(renderAccount).catch(()=>{});
 $('bOut').onclick=()=>run('Signed out','acct_logout').then(renderAccount).catch(()=>{});
 $('aDev').onchange=e=>run('Printer selected','acct_select',{sn:e.target.value}).then(renderAccount).catch(()=>{});
-$('bConn').onclick=()=>run('Connected','acct_connect',{},60000).then(renderAccount).catch(()=>{});
+$('bConn').onclick=()=>run(null,'acct_connect',{},90000).then(renderAccount).catch(()=>{});
+$('aAuto').onchange=e=>run(null,'acct_auto',{on:e.target.checked}).catch(()=>{});
 $('bPause').onclick=()=>run('Paused',1021).catch(()=>{});
 $('bResume').onclick=()=>run('Resumed',1023).catch(()=>{});
 $('bStop').onclick=()=>{ $('cfmStop').style.display='block'; };
