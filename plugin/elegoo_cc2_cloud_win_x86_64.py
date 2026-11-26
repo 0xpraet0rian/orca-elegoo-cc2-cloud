@@ -283,6 +283,7 @@ class Hub:
                 self.log("RTM login ok")
                 if self.was_connected:
                     self._fire_local_connect(0, "")
+                threading.Thread(target=self._after_login, daemon=True).start()
             elif t == "login_err" and not stale:
                 self.rtm_online = False
                 self.login_error = str(data.get("error"))
@@ -305,6 +306,18 @@ class Hub:
                 threading.Thread(target=self._safe_login, daemon=True).start()
         except Exception as e:
             self.log("on_page_message error: %r" % e)
+
+    def _after_login(self):
+        try:
+            r = self.request(1001, {}, timeout=15)
+            self.attrs = r
+            self._post({"type": "info", "name": r.get("hostname") or self.dev_name,
+                        "model": r.get("machine_model", ""), "ip": r.get("ip", ""), "sn": self.sn,
+                        "fw": _dict(r.get("software_version")).get("ota_version", "")})
+            if not (self.poll_thread and self.poll_thread.is_alive() and not self.poll_stop.is_set()):
+                self.start_poll()
+        except Exception as e:
+            self.log("after login: %s" % e)
 
     def _safe_login(self):
         try:
@@ -433,7 +446,7 @@ class Hub:
     # ---- status -> Bambu-style push_status
     def _emit_status(self):
         fn = self.cb.get("local_message")
-        if not fn or not self.sn:
+        if not self.sn:
             return
         s = self.status
         ps, ms = _dict(s.get("print_status")), _dict(s.get("machine_status"))
@@ -471,13 +484,17 @@ class Hub:
             "gcode_file": str(ps.get("filename", "") or ""),
             "print_type": "local", "wifi_signal": "-50dBm", "hw_ver": "", "sw_ver": str(sw),
         }}
-        try:
-            fn(self.sn, json.dumps(msg))
-        except Exception as e:
-            self.logs.append("local_message cb failed: %r" % e)
+        if fn:
+            try:
+                fn(self.sn, json.dumps(msg))
+            except Exception as e:
+                self.logs.append("local_message cb failed: %r" % e)
+        pr = msg["print"]
         self._post({"type": "status", "state": gs, "progress": pct,
-                    "nozzle": msg["print"]["nozzle_temper"], "bed": msg["print"]["bed_temper"],
-                    "file": msg["print"]["subtask_name"]})
+                    "nozzle": pr["nozzle_temper"], "nozzle_t": pr["nozzle_target_temper"],
+                    "bed": pr["bed_temper"], "bed_t": pr["bed_target_temper"],
+                    "chamber": pr["chamber_temper"], "layer": pr["layer_num"], "total": pr["total_layer_num"],
+                    "left": pr["mc_remaining_time"], "file": pr["subtask_name"]})
 
     def _fire_local_connect(self, status, msg=""):
         fn = self.cb.get("local_connect")
@@ -910,9 +927,27 @@ PAGE_HTML = r"""<!doctype html><meta charset="utf-8">
  .row{margin:6px 0} b{color:var(--orca-accent,#00ae42)}
  pre{background:rgba(0,0,0,.25);padding:8px;max-height:330px;overflow:auto;white-space:pre-wrap}
  button{padding:5px 12px;margin-right:6px}
+ .card{border:1px solid var(--orca-border,#444);border-radius:8px;padding:12px;margin:10px 0;max-width:760px}
+ .name{font-size:16px;font-weight:600} .sub{color:var(--orca-muted,#999);margin:4px 0}
+ .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:10px;margin:10px 0}
+ .k{display:block;color:var(--orca-muted,#999);font-size:11px;text-transform:uppercase}
 </style>
 <h3>Elegoo CC2 - cloud link</h3>
-<div class="row">RTM: <b id="rtm">starting</b> &nbsp; Printer: <b id="st">-</b> <span id="det"></span></div>
+<div class="row">RTM: <b id="rtm">starting</b></div>
+<div class="card">
+  <div class="name" id="pname">Printer: waiting for data...</div>
+  <div class="sub" id="pinfo"></div>
+  <div class="grid">
+    <div><span class="k">State</span><b id="st">-</b></div>
+    <div><span class="k">Progress</span><b id="pg">-</b></div>
+    <div><span class="k">Nozzle</span><b id="nz">-</b></div>
+    <div><span class="k">Bed</span><b id="bd">-</b></div>
+    <div><span class="k">Chamber</span><b id="ch">-</b></div>
+    <div><span class="k">Layer</span><b id="ly">-</b></div>
+    <div><span class="k">Remaining</span><b id="lf">-</b></div>
+  </div>
+  <div class="sub" id="det"></div>
+</div>
 <div class="row"><button id="b">Connect / reconnect</button><span style="color:var(--orca-muted,#999)">Close ElegooSlicer while connected (one session per account).</span></div>
 <pre id="log"></pre>
 <script>
@@ -974,7 +1009,13 @@ async function handle(m){
   }
   else if(m.type==='log') L(m.line);
   else if(m.type==='logs') (m.lines||[]).forEach(L);
-  else if(m.type==='status'){ $('st').textContent=m.state+' '+m.progress+'%'; $('det').textContent='nozzle '+m.nozzle+' / bed '+m.bed+' '+(m.file||''); }
+  else if(m.type==='info'){ $('pname').textContent=m.name||'Printer'; $('pinfo').textContent=[m.model,'firmware '+(m.fw||'?'),'LAN IP '+(m.ip||'?')].join('  |  '); }
+  else if(m.type==='status'){
+    const t=(a,b)=>Math.round(a)+(b?' / '+Math.round(b):'')+' C';
+    $('st').textContent=m.state; $('pg').textContent=m.progress+'%';
+    $('nz').textContent=t(m.nozzle,m.nozzle_t); $('bd').textContent=t(m.bed,m.bed_t); $('ch').textContent=Math.round(m.chamber)+' C';
+    $('ly').textContent=m.total?(m.layer+' / '+m.total):'-'; $('lf').textContent=m.left?(m.left+' min'):'-';
+    $('det').textContent=m.file?('File: '+m.file):''; }
   else if(m.type==='batch'){ for(const it of (m.items||[])) await handle(it); }
 }
 orca.onMessage(handle);
