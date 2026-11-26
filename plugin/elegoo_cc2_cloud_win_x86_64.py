@@ -392,12 +392,20 @@ class LoginProxy:
         self._reply(c, 200, b"{}", [("Content-Type", "application/json")])
 
     SHIM = """<script>(function(){var N="__NONCE__";
+// The Elegoo page picks its desktop-client IPC from navigator.userAgent ("ElegooSlicer") and then talks to
+// window.nativeIpc; in a plain browser it stays in "browser mode" and never reports the session.
+try{var ua=navigator.userAgent+' ElegooSlicer/1.5.3';Object.defineProperty(navigator,'userAgent',{get:function(){return ua;},configurable:true});}catch(e){}
+var seq=0;
+function post(m){return fetch('/__wx/'+N,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(m)}).then(function(r){if(!r.ok)throw new Error('bridge '+r.status);return r;});}
+window.nativeIpc={
+ request:function(method,params,timeout){return post({id:'ni-'+(++seq),method:method,type:'request',params:params||{}}).then(function(){return {};});},
+ sendEvent:function(method,data){post({id:null,method:method,type:'event',params:data||{}}).catch(function(){});},
+ onRequest:function(){},on:function(){},off:function(){}};
 function rep(id,m,code,msg,data){setTimeout(function(){try{window.HandleStudio&&window.HandleStudio({id:id,method:m,type:'response',code:code,message:msg,data:data});}catch(e){}},0);}
 window.wx={postMessage:function(s){var m;try{m=JSON.parse(s);}catch(e){return;}
  if(!m||m.type!=='request')return;
- var forward=true;
- if(forward){fetch('/__wx/'+N,{method:'POST',headers:{'Content-Type':'application/json'},body:s}).then(function(){rep(m.id,m.method,0,'success',{});}).catch(function(){rep(m.id,m.method,1,'failed',null);});}
- else{rep(m.id,m.method,0,'success',{});}}};})();</script>"""
+ post(m).then(function(){rep(m.id,m.method,0,'success',{});}).catch(function(){rep(m.id,m.method,1,'failed',null);});}};
+})();</script>"""
 
     def _proxy(self, c, method, path, hdrs, body):
         origin = "http://127.0.0.1:%d" % self.port
@@ -945,6 +953,7 @@ class Hub:
             m = data.get("method") if isinstance(data, dict) else None
             self.log("sign-in page message: %s" % (m or type(data).__name__))
             if m == "report.userInfo":
+                self.log("sign-in page reported user info; fields: %s" % sorted(_dict(data.get("params")).keys()))
                 threading.Thread(target=self._store_login, args=(_dict(data.get("params")),), daemon=True).start()
             elif m == "report.websiteOpen":
                 url = str(_dict(data.get("params")).get("url", ""))
