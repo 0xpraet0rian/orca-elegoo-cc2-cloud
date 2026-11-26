@@ -1974,7 +1974,10 @@ class CC2Agent(pa.PrinterAgentBase):
 
     def send_message_to_printer(self, dev_id, json_str, qos, flag):
         try:
-            p = (json.loads(json_str) or {}).get("print", {})
+            doc = json.loads(json_str) or {}
+            if "pushing" in doc or "info" in doc or "system" in doc:
+                return 0   # Bambu-style state polling; the plugin gets status over RTM on its own
+            p = doc.get("print", {})
             cmd, param = p.get("command"), str(p.get("param", ""))
             if cmd == "pause":
                 return self._rc(1021)
